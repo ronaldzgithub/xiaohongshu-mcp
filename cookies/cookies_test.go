@@ -14,7 +14,7 @@ import (
 func TestGetCookiesFilePath(t *testing.T) {
 	t.Run("显式指定的COOKIES_PATH永远最优先", func(t *testing.T) {
 		dir := t.TempDir()
-		t.Setenv("TMPDIR", dir)
+		setTempDirForTest(t, dir)
 		t.Setenv("COOKIES_PATH", "/custom/cookies.json")
 
 		// 即使 /tmp 下躺着旧文件，也不能盖掉显式配置
@@ -25,7 +25,7 @@ func TestGetCookiesFilePath(t *testing.T) {
 
 	t.Run("未设COOKIES_PATH时本地目录优先于tmp", func(t *testing.T) {
 		tmp := t.TempDir()
-		t.Setenv("TMPDIR", tmp)
+		setTempDirForTest(t, tmp)
 		t.Setenv("COOKIES_PATH", "")
 
 		assert.NoError(t, os.WriteFile(filepath.Join(tmp, "cookies.json"), []byte("[]"), 0644))
@@ -38,7 +38,7 @@ func TestGetCookiesFilePath(t *testing.T) {
 
 	t.Run("本地没有时兜底到tmp旧路径", func(t *testing.T) {
 		tmp := t.TempDir()
-		t.Setenv("TMPDIR", tmp)
+		setTempDirForTest(t, tmp)
 		t.Setenv("COOKIES_PATH", "")
 		t.Chdir(t.TempDir()) // 本地目录是空的
 
@@ -50,12 +50,21 @@ func TestGetCookiesFilePath(t *testing.T) {
 
 	t.Run("都不存在时回退当前目录", func(t *testing.T) {
 		dir := t.TempDir()
-		t.Setenv("TMPDIR", dir)
+		setTempDirForTest(t, dir)
 		t.Setenv("COOKIES_PATH", "")
 		t.Chdir(t.TempDir())
 
 		assert.Equal(t, "cookies.json", GetCookiesFilePath())
 	})
+}
+
+// os.TempDir follows TMPDIR on Unix and TEMP/TMP on Windows.  Set all three
+// so this test never observes or writes the host's real temporary directory.
+func setTempDirForTest(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TEMP", dir)
+	t.Setenv("TMP", dir)
 }
 
 // TestLoadSaveDeleteCookies 校验 cookie 文件存取往返与删除的幂等。
