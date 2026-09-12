@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -21,6 +22,24 @@ import (
 // XiaohongshuService 小红书业务服务
 type XiaohongshuService struct {
 	logins loginSessions
+}
+
+// externalActionsEnabled 是原生写操作的最后一道安全开关。
+// Huaxiaobao 仍须在调用前校验具名批准；该开关本身不代表批准。
+func externalActionsEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("XHS_ENABLE_EXTERNAL_ACTIONS"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func requireExternalActionsEnabled() error {
+	if !externalActionsEnabled() {
+		return fmt.Errorf("外部动作默认关闭；仅在受控执行边界显式设置 XHS_ENABLE_EXTERNAL_ACTIONS=true 后允许")
+	}
+	return nil
 }
 
 // NewXiaohongshuService 创建小红书服务实例
@@ -203,6 +222,10 @@ func (s *XiaohongshuService) waitScanInBackground(
 
 // PublishContent 发布内容
 func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishRequest) (*PublishResponse, error) {
+	if err := requireExternalActionsEnabled(); err != nil {
+		return nil, err
+	}
+
 	// 验证标题长度（小红书限制：最大20个字）
 	if xhsutil.CalcTitleLength(req.Title) > 20 {
 		return nil, fmt.Errorf("标题长度超过限制")
@@ -288,6 +311,10 @@ func (s *XiaohongshuService) publishContent(ctx context.Context, content xiaohon
 
 // PublishVideo 发布视频（本地文件）
 func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideoRequest) (*PublishVideoResponse, error) {
+	if err := requireExternalActionsEnabled(); err != nil {
+		return nil, err
+	}
+
 	// 标题长度校验（小红书限制：最大20个字）
 	if xhsutil.CalcTitleLength(req.Title) > 20 {
 		return nil, fmt.Errorf("标题长度超过限制")
@@ -470,6 +497,10 @@ func (s *XiaohongshuService) UserProfile(ctx context.Context, userID, xsecToken,
 
 // PostCommentToFeed 发表评论到Feed
 func (s *XiaohongshuService) PostCommentToFeed(ctx context.Context, feedID, xsecToken, content string) (*PostCommentResponse, error) {
+	if err := requireExternalActionsEnabled(); err != nil {
+		return nil, err
+	}
+
 	b := newBrowser()
 	defer b.Close()
 
@@ -487,6 +518,10 @@ func (s *XiaohongshuService) PostCommentToFeed(ctx context.Context, feedID, xsec
 
 // LikeFeed 点赞笔记
 func (s *XiaohongshuService) LikeFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
+	if err := requireExternalActionsEnabled(); err != nil {
+		return nil, err
+	}
+
 	b := newBrowser()
 	defer b.Close()
 
@@ -502,6 +537,10 @@ func (s *XiaohongshuService) LikeFeed(ctx context.Context, feedID, xsecToken str
 
 // UnlikeFeed 取消点赞笔记
 func (s *XiaohongshuService) UnlikeFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
+	if err := requireExternalActionsEnabled(); err != nil {
+		return nil, err
+	}
+
 	b := newBrowser()
 	defer b.Close()
 
@@ -517,6 +556,10 @@ func (s *XiaohongshuService) UnlikeFeed(ctx context.Context, feedID, xsecToken s
 
 // FavoriteFeed 收藏笔记
 func (s *XiaohongshuService) FavoriteFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
+	if err := requireExternalActionsEnabled(); err != nil {
+		return nil, err
+	}
+
 	b := newBrowser()
 	defer b.Close()
 
@@ -532,6 +575,10 @@ func (s *XiaohongshuService) FavoriteFeed(ctx context.Context, feedID, xsecToken
 
 // UnfavoriteFeed 取消收藏笔记
 func (s *XiaohongshuService) UnfavoriteFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
+	if err := requireExternalActionsEnabled(); err != nil {
+		return nil, err
+	}
+
 	b := newBrowser()
 	defer b.Close()
 
@@ -547,6 +594,10 @@ func (s *XiaohongshuService) UnfavoriteFeed(ctx context.Context, feedID, xsecTok
 
 // ReplyCommentToFeed 回复指定评论
 func (s *XiaohongshuService) ReplyCommentToFeed(ctx context.Context, feedID, xsecToken, commentID, userID, content string) (*ReplyCommentResponse, error) {
+	if err := requireExternalActionsEnabled(); err != nil {
+		return nil, err
+	}
+
 	b := newBrowser()
 	defer b.Close()
 
@@ -597,6 +648,10 @@ func (s *XiaohongshuService) ListNotifications(ctx context.Context, tab string, 
 
 // LikeNotification 给通知里的评论点赞或取消点赞
 func (s *XiaohongshuService) LikeNotification(ctx context.Context, commentID string, unlike bool) (*xiaohongshu.NotificationLikeResult, error) {
+	if err := requireExternalActionsEnabled(); err != nil {
+		return nil, err
+	}
+
 	b := newBrowser()
 	defer b.Close()
 
@@ -608,6 +663,10 @@ func (s *XiaohongshuService) LikeNotification(ctx context.Context, commentID str
 
 // ReplyNotification 在通知页就地回复评论
 func (s *XiaohongshuService) ReplyNotification(ctx context.Context, commentID, content string) (*xiaohongshu.NotificationReplyResult, error) {
+	if err := requireExternalActionsEnabled(); err != nil {
+		return nil, err
+	}
+
 	b := newBrowser()
 	defer b.Close()
 

@@ -91,11 +91,11 @@ func TestNotificationToolsRegistered(t *testing.T) {
 	}
 }
 
-// TestListNotificationsIsNotReadOnly 固定 list_notifications 的真实副作用分类。
+// TestStateChangingReadsAreNotReadOnly 固定隐含状态变更能力的真实副作用分类。
 //
-// 打开通知分区会清除该分区未读标记，因此即使返回内容本身只是通知列表，
-// 也不能向 MCP 调用方声明为只读工具。
-func TestListNotificationsIsNotReadOnly(t *testing.T) {
+// 打开通知分区会清除未读标记，生成二维码会创建临时登录会话；即使两者
+// 都以读取数据为主要结果，也不能向 MCP 调用方声明为只读工具。
+func TestStateChangingReadsAreNotReadOnly(t *testing.T) {
 	router := setupRoutes(NewAppServer(NewXiaohongshuService(), ""))
 	server := httptest.NewServer(router)
 	defer server.Close()
@@ -122,17 +122,20 @@ func TestListNotificationsIsNotReadOnly(t *testing.T) {
 	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
 
-	for _, tool := range result.Result.Tools {
-		if tool.Name != "list_notifications" {
-			continue
+	for _, expected := range []string{"get_login_qrcode", "list_notifications"} {
+		found := false
+		for _, tool := range result.Result.Tools {
+			if tool.Name != expected {
+				continue
+			}
+			found = true
+			if tool.Annotations.ReadOnlyHint != nil {
+				assert.False(t, *tool.Annotations.ReadOnlyHint,
+					"%s 会改变平台或登录会话状态，不能声明为只读", expected)
+			}
 		}
-		if tool.Annotations.ReadOnlyHint != nil {
-			assert.False(t, *tool.Annotations.ReadOnlyHint,
-				"list_notifications 会清除未读标记，不能声明为只读")
-		}
-		return
+		assert.True(t, found, "工具 %s 未注册", expected)
 	}
-	t.Fatal("list_notifications 工具未注册")
 }
 
 // TestNotificationRoutesRegistered 固定通知的 HTTP 路由存在。

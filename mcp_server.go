@@ -200,7 +200,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 			Description: "获取登录二维码（返回 Base64 图片和超时时间）",
 			Annotations: &mcp.ToolAnnotations{
 				Title:        "Get Login QR Code",
-				ReadOnlyHint: true,
+				ReadOnlyHint: false,
 			},
 		},
 		withPanicRecovery("get_login_qrcode", func(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
