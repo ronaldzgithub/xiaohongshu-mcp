@@ -52,18 +52,33 @@ Foundry 拥有销售目标、内容计划、客户/商机语义、预算、报�
 浏览器二进制。两者缺一、路径非绝对路径、文件不是普通文件或哈希漂移时均拒绝启动；
 设置该绑定后不会进入运行时浏览器下载路径。未设置时保留原有固定版本下载行为，便于普通本地开发。
 
+Windows 使用仓库内的 `headless_browser v0.4.0` 最小补丁版（原 MIT 许可证及
+上游来源见 `third_party/headless_browser`）。它新增 `WithLeakless(bool)`，Windows
+默认关闭 rod 的 `leakless.exe` 辅助进程，避免其动态提取行为被 Defender 拦截；
+浏览器仍由 DevTools `Browser.close` 正常退出，launcher 等待退出并清理临时 profile。
+其他平台保留上游默认。升级该依赖时应从新上游 tag 重做这几个最小增量，禁止以关闭、
+排除或放宽终端安全策略替代源码修复。
+
 升级时记录 upstream commit、Fork 改造 commit、Go/依赖版本和镜像 digest；先在隔离环境运行单元测试、MCP 合同测试和无真实外部动作检查，再由发布门批准。
 
 ## 当前验收状态
 
 - 源码基线：已记录。
-- 本地运行：已用 Go 1.27.0 完成编译和定向测试；尚未启动浏览器服务或连接真实账号。
+- 本地运行：已用 Go 1.27.0 编译服务与 adapter，并在 Windows 独立回环端口以固定
+  Chrome `148.0.7778.215`（二进制 SHA256
+  `1867319e56bcabbc4681d8575c002106ce7b61b5290dc5eb34a37676805f6915`）、
+  `AUTH_TOKEN`、`XHS_ENABLE_EXTERNAL_ACTIONS=false` 和空 Cookie 完成 machine-check smoke：
+  `/health` 为 200，未鉴权 `login/status` 为 401，鉴权请求为 200 且
+  `is_logged_in=false`；adapter 返回 `BLOCKED/ACCOUNT_LOGIN_REQUIRED`、
+  `external_action_performed=false`。请求结束后没有遗留该固定浏览器进程，也不再出现
+  Defender error 225。该结果不是账号或平台现场验证。
 - 合同：原生 MCP/HTTP 合同存在；已增加 Huaxiaobao 可调用的 `account.status` 最小版本化 adapter，外发合同仍未开放。
 - 真实账号：未提供，未验证。
 - 获批动作：未执行。
 - 人工 ACK、服务重启、重复/迟到结果、权限撤销和检查点恢复：尚无真实证据。
 
-本次 `go test . ./cmd/huaxiaobao-adapter` 通过。`go test ./...` 仅在既有
+本次补丁依赖模块 `go test ./...` 以及根仓
+`go test . ./browser ./cmd/huaxiaobao-adapter` 通过。`go test ./...` 仅在既有
 `cookies/TestGetCookiesFilePath/本地没有时兜底到tmp旧路径` 上失败：Windows
 短路径临时目录期望与工作目录中的 `cookies.json` 选择不同；新增根包和 adapter
 测试均通过。该环境差异不代表全量测试通过，也未被改写为新功能证据。

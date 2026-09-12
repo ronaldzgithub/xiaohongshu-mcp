@@ -3,6 +3,7 @@ package browser
 import (
 	"fmt"
 	"net/url"
+	"runtime"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -64,6 +65,8 @@ func NewBrowser(headless bool, options ...Option) *headless_browser.Browser {
 
 	opts := []headless_browser.Option{
 		headless_browser.WithHeadless(headless),
+		// Windows 服务通过 Browser.Close 回收进程；禁用会被 Defender 拦截的 leakless.exe。
+		headless_browser.WithLeakless(runtime.GOOS != "windows"),
 		// 用内置浏览器的默认配置，不强制 UA。
 		headless_browser.WithFingerprint(""), // 空 = 按运行 OS 自动：Linux→windows，mac→macos
 		headless_browser.WithStealthJS(false),

@@ -15,6 +15,10 @@ require (
 	github.com/xpzouying/headless_browser v0.4.0
 )
 
+// v0.4.0 does not expose rod's leakless switch. The local, MIT-licensed patch
+// adds that option so Windows sandbox processes do not execute leakless.exe.
+replace github.com/xpzouying/headless_browser => ./third_party/headless_browser
+
 require (
 	github.com/bytedance/sonic v1.11.6 // indirect
 	github.com/bytedance/sonic/loader v0.1.1 // indirect
