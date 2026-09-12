@@ -47,6 +47,11 @@ Foundry 拥有销售目标、内容计划、客户/商机语义、预算、报�
 
 生产部署由 VolvenceDeploy 接收获批的部署规格后执行。持久化数据目录保存 Cookie，但必须位于 Huaxiaobao 执行边界；服务应启用 `AUTH_TOKEN`，限制监听地址和网络访问。不得因本说明擅自重启或替换现有 Foundry/Huaxiaobao 实例。
 
+隔离或离线部署可同时设置 `XHS_BROWSER_BINARY` 与
+`XHS_BROWSER_BINARY_SHA256`，显式使用部署方预置并校验的小写 SHA256
+浏览器二进制。两者缺一、路径非绝对路径、文件不是普通文件或哈希漂移时均拒绝启动；
+设置该绑定后不会进入运行时浏览器下载路径。未设置时保留原有固定版本下载行为，便于普通本地开发。
+
 升级时记录 upstream commit、Fork 改造 commit、Go/依赖版本和镜像 digest；先在隔离环境运行单元测试、MCP 合同测试和无真实外部动作检查，再由发布门批准。
 
 ## 当前验收状态

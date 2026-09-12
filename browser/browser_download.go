@@ -31,6 +31,11 @@ var browserVersionRaw string
 
 var browserVersion = strings.TrimSpace(browserVersionRaw)
 
+const (
+	browserBinaryEnv       = "XHS_BROWSER_BINARY"
+	browserBinarySHA256Env = "XHS_BROWSER_BINARY_SHA256"
+)
+
 func browserURL(name string) string {
 	return browserCDNBase + "/" + browserVersion + "/" + name
 }
@@ -69,6 +74,13 @@ func browserCacheDir() (string, error) {
 // EnsureBrowser 确保本地存在内置浏览器二进制，返回其路径。
 // 已缓存则直接返回；否则下载 → 校验 SHA256 → 解压。当前平台无预编译二进制时返回 error。
 func EnsureBrowser() (string, error) {
+	if binPath := strings.TrimSpace(os.Getenv(browserBinaryEnv)); binPath != "" {
+		return verifyPinnedBrowserBinary(binPath, strings.TrimSpace(os.Getenv(browserBinarySHA256Env)))
+	}
+	if strings.TrimSpace(os.Getenv(browserBinarySHA256Env)) != "" {
+		return "", fmt.Errorf("%s 已设置但 %s 缺失", browserBinarySHA256Env, browserBinaryEnv)
+	}
+
 	asset, binName, ok := platformAsset()
 	if !ok {
 		return "", fmt.Errorf("当前平台 %s/%s 无预编译浏览器，暂不支持", runtime.GOOS, runtime.GOARCH)
@@ -123,6 +135,40 @@ func EnsureBrowser() (string, error) {
 	}
 	logrus.Infof("内置浏览器就绪: %s", bin)
 	return bin, nil
+}
+
+// verifyPinnedBrowserBinary 校验部署方预置的浏览器，避免隔离运行时联网下载。
+func verifyPinnedBrowserBinary(binPath, expectedSHA256 string) (string, error) {
+	if !filepath.IsAbs(binPath) {
+		return "", fmt.Errorf("%s 必须是绝对路径", browserBinaryEnv)
+	}
+	if len(expectedSHA256) != sha256.Size*2 || expectedSHA256 != strings.ToLower(expectedSHA256) {
+		return "", fmt.Errorf("%s 必须是小写 SHA256", browserBinarySHA256Env)
+	}
+	if _, err := hex.DecodeString(expectedSHA256); err != nil {
+		return "", fmt.Errorf("%s 格式无效", browserBinarySHA256Env)
+	}
+	info, err := os.Lstat(binPath)
+	if err != nil {
+		return "", fmt.Errorf("预置浏览器不可用: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("预置浏览器必须是普通文件")
+	}
+	f, err := os.Open(binPath)
+	if err != nil {
+		return "", fmt.Errorf("打开预置浏览器失败: %w", err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("读取预置浏览器失败: %w", err)
+	}
+	actual := hex.EncodeToString(h.Sum(nil))
+	if actual != expectedSHA256 {
+		return "", fmt.Errorf("预置浏览器 SHA256 不匹配：期望 %s，实际 %s", expectedSHA256, actual)
+	}
+	return filepath.Clean(binPath), nil
 }
 
 // verifySHA256 下载同目录的 SHA256SUMS，校验 asset 的哈希。
