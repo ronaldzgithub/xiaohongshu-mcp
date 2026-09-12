@@ -91,6 +91,50 @@ func TestNotificationToolsRegistered(t *testing.T) {
 	}
 }
 
+// TestListNotificationsIsNotReadOnly 固定 list_notifications 的真实副作用分类。
+//
+// 打开通知分区会清除该分区未读标记，因此即使返回内容本身只是通知列表，
+// 也不能向 MCP 调用方声明为只读工具。
+func TestListNotificationsIsNotReadOnly(t *testing.T) {
+	router := setupRoutes(NewAppServer(NewXiaohongshuService(), ""))
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	var result struct {
+		Result struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				Annotations struct {
+					ReadOnlyHint *bool `json:"readOnlyHint"`
+				} `json:"annotations"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+
+	for _, tool := range result.Result.Tools {
+		if tool.Name != "list_notifications" {
+			continue
+		}
+		if tool.Annotations.ReadOnlyHint != nil {
+			assert.False(t, *tool.Annotations.ReadOnlyHint,
+				"list_notifications 会清除未读标记，不能声明为只读")
+		}
+		return
+	}
+	t.Fatal("list_notifications 工具未注册")
+}
+
 // TestNotificationRoutesRegistered 固定通知的 HTTP 路由存在。
 //
 // 读路由表而不是发请求：这些 handler 会真的起浏览器访问小红书，

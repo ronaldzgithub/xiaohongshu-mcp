@@ -507,7 +507,7 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 			Description: "获取通知列表。返回评论内容、评论者、以及对应笔记的 feed_id 和 xsec_token（可用于 get_feed_detail 读原帖）。已删除或不可见的条目会被过滤，过滤数量见 filtered 字段。注意：会清除该分区的未读标记，只需要未读数时用 get_unread_count。",
 			Annotations: &mcp.ToolAnnotations{
 				Title:        "List Notifications",
-				ReadOnlyHint: true,
+				ReadOnlyHint: false,
 			},
 		},
 		withPanicRecovery("list_notifications", func(ctx context.Context, req *mcp.CallToolRequest, args ListNotificationsArgs) (*mcp.CallToolResult, any, error) {
