@@ -56,6 +56,9 @@ func (p *PublishAction) PublishVideo(ctx context.Context, content PublishVideoCo
 	if content.VideoPath == "" {
 		return errors.New("视频不能为空")
 	}
+	if err := p.beginSubmission(); err != nil {
+		return err
+	}
 
 	// 重设超时：.Context(ctx) 会替换掉 NewPublishVideoAction 里 Timeout(300s) 的 deadline
 	page := p.page.Context(ctx).Timeout(300 * time.Second)
@@ -151,6 +154,7 @@ func submitPublishVideo(ctx context.Context, page *rod.Page, title, content stri
 		return err
 	}
 
-	// 校验发布真的成功（成功跳转离开发布页），未跳转判失败——消除假成功
-	return waitPublishSuccess(page, 15*time.Second)
+	// 视频同样只有取得稳定 feed_id 才能确认；否则禁止调用方重发。
+	_, err = waitPublishResult(page, 15*time.Second)
+	return err
 }

@@ -886,7 +886,7 @@ npx mcporter list xiaohongshu-mcp
 - `check_login_status` - 检查小红书登录状态（无参数）
 - `get_login_qrcode` - 获取登录二维码，返回 Base64 图片和超时时间（无参数）
 - `delete_cookies` - 删除 cookies 文件，重置登录状态，删除后需要重新登录（无参数）
-- `publish_content` - 发布图文内容到小红书（必需：title, content, images）
+- `publish_content` - 发布图文内容到小红书（必需：request_id, idempotency_key, title, content, images；仅取得稳定 feed_id 才确认）
   - `images`: 图片路径列表（至少1张），支持 HTTP 链接或本地绝对路径，推荐使用本地路径
   - `tags`: 话题标签列表（可选），如 `["美食", "旅行", "生活"]`
   - `schedule_at`: 定时发布时间（可选），ISO8601 格式，支持 1 小时至 14 天内

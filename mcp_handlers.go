@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -123,6 +124,8 @@ func (s *AppServer) handleDeleteCookies(ctx context.Context) *MCPToolResult {
 func (s *AppServer) handlePublishContent(ctx context.Context, args map[string]interface{}) *MCPToolResult {
 	logrus.Info("MCP: 发布内容")
 
+	requestID, _ := args["request_id"].(string)
+	idempotencyKey, _ := args["idempotency_key"].(string)
 	title, _ := args["title"].(string)
 	content, _ := args["content"].(string)
 	imagePathsInterface, _ := args["images"].([]interface{})
@@ -158,18 +161,29 @@ func (s *AppServer) handlePublishContent(ctx context.Context, args map[string]in
 	logrus.Infof("MCP: 发布内容 - 标题: %s, 图片数量: %d, 标签数量: %d, 定时: %s, 原创: %v, visibility: %s, 商品: %v", title, len(imagePaths), len(tags), scheduleAt, isOriginal, visibility, products)
 
 	req := &PublishRequest{
-		Title:      title,
-		Content:    content,
-		Images:     imagePaths,
-		Tags:       tags,
-		ScheduleAt: scheduleAt,
-		IsOriginal: isOriginal,
-		Visibility: visibility,
-		Products:   products,
+		RequestID:      requestID,
+		IdempotencyKey: idempotencyKey,
+		Title:          title,
+		Content:        content,
+		Images:         imagePaths,
+		Tags:           tags,
+		ScheduleAt:     scheduleAt,
+		IsOriginal:     isOriginal,
+		Visibility:     visibility,
+		Products:       products,
 	}
 
 	result, err := s.xiaohongshuService.PublishContent(ctx, req)
 	if err != nil {
+		if errors.Is(err, xiaohongshu.ErrPublishResultUnverifiable) || errors.Is(err, ErrPublishAttemptInFlight) {
+			return &MCPToolResult{
+				Content: []MCPContent{{
+					Type: "text",
+					Text: fmt.Sprintf("发布结果 UNKNOWN: request_id=%s；必须查询或转人工，禁止重发", requestID),
+				}},
+				IsError: true,
+			}
+		}
 		return &MCPToolResult{
 			Content: []MCPContent{{
 				Type: "text",
@@ -179,7 +193,7 @@ func (s *AppServer) handlePublishContent(ctx context.Context, args map[string]in
 		}
 	}
 
-	resultText := fmt.Sprintf("内容发布成功: %+v", result)
+	resultText := fmt.Sprintf("内容发布结果已验证: %+v", result)
 	return &MCPToolResult{
 		Content: []MCPContent{{
 			Type: "text",

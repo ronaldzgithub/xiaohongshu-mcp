@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/xpzouying/xiaohongshu-mcp/cookies"
 	"github.com/xpzouying/xiaohongshu-mcp/xiaohongshu"
@@ -92,15 +94,49 @@ func (s *AppServer) publishHandler(c *gin.Context) {
 			"请求参数错误", err.Error())
 		return
 	}
+	if err := bindPublishIdentity(c, &req); err != nil {
+		respondError(c, http.StatusBadRequest, "PUBLISH_IDENTITY_INVALID", err.Error(), nil)
+		return
+	}
 
 	result, err := s.xiaohongshuService.PublishContent(c.Request.Context(), &req)
 	if err != nil {
+		switch {
+		case errors.Is(err, xiaohongshu.ErrPublishResultUnverifiable), errors.Is(err, ErrPublishAttemptInFlight):
+			respondError(c, http.StatusAccepted, "PUBLISH_RESULT_UNKNOWN",
+				"发布结果不可验证；必须按 request_id 查询或转人工，禁止重发", result)
+			return
+		case errors.Is(err, ErrPublishIdentityRequired):
+			respondError(c, http.StatusBadRequest, "PUBLISH_IDENTITY_REQUIRED", err.Error(), nil)
+			return
+		case errors.Is(err, ErrPublishIdentityConflict):
+			respondError(c, http.StatusConflict, "IDEMPOTENCY_CONFLICT", err.Error(), nil)
+			return
+		}
 		respondError(c, http.StatusInternalServerError, "PUBLISH_FAILED",
 			"发布失败", err.Error())
 		return
 	}
 
-	respondSuccess(c, result, "发布成功")
+	respondSuccess(c, result, "发布结果已取得稳定对象 ID")
+}
+
+func bindPublishIdentity(c *gin.Context, req *PublishRequest) error {
+	headerRequestID := strings.TrimSpace(c.GetHeader("X-Request-ID"))
+	headerIdempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if req.RequestID != "" && headerRequestID != "" && req.RequestID != headerRequestID {
+		return errors.New("body request_id 与 X-Request-ID 不一致")
+	}
+	if req.IdempotencyKey != "" && headerIdempotencyKey != "" && req.IdempotencyKey != headerIdempotencyKey {
+		return errors.New("body idempotency_key 与 Idempotency-Key 不一致")
+	}
+	if req.RequestID == "" {
+		req.RequestID = headerRequestID
+	}
+	if req.IdempotencyKey == "" {
+		req.IdempotencyKey = headerIdempotencyKey
+	}
+	return nil
 }
 
 // publishVideoHandler 发布视频内容

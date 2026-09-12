@@ -2,11 +2,15 @@ package xiaohongshu
 
 import (
 	"context"
+	stderrors "errors"
 	"log/slog"
 	"math/rand"
+	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -31,7 +35,23 @@ type PublishImageContent struct {
 
 type PublishAction struct {
 	page *rod.Page
+
+	mu        sync.Mutex
+	submitted bool
 }
+
+// PublishResult 是发布后从受信页面地址中读取的稳定对象证据。
+type PublishResult struct {
+	FeedID      string
+	XsecToken   string
+	EvidenceURL string
+}
+
+// ErrPublishResultUnverifiable 表示可能已经产生外部动作，但当前页面无法证明稳定对象 ID。
+// 调用方必须查询结果或转人工，不能以相同请求再次发布。
+var ErrPublishResultUnverifiable = stderrors.New("发布结果不可验证")
+
+var feedIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{24}$`)
 
 const (
 	urlOfPublic = `https://creator.xiaohongshu.com/publish/publish?source=official`
@@ -70,16 +90,26 @@ func NewPublishImageAction(page *rod.Page) (*PublishAction, error) {
 	}, nil
 }
 
+// Publish 保留原有调用签名；只有取得稳定 feed_id 才返回 nil。
 func (p *PublishAction) Publish(ctx context.Context, content PublishImageContent) error {
+	_, err := p.PublishWithResult(ctx, content)
+	return err
+}
+
+// PublishWithResult 发布图文并返回可复验的稳定对象证据。
+func (p *PublishAction) PublishWithResult(ctx context.Context, content PublishImageContent) (*PublishResult, error) {
 	if len(content.ImagePaths) == 0 {
-		return errors.New("图片不能为空")
+		return nil, errors.New("图片不能为空")
+	}
+	if err := p.beginSubmission(); err != nil {
+		return nil, err
 	}
 
 	// 重设超时：.Context(ctx) 会替换掉 NewPublishImageAction 里 Timeout(300s) 的 deadline
 	page := p.page.Context(ctx).Timeout(300 * time.Second)
 
 	if err := uploadImages(page, content.ImagePaths); err != nil {
-		return errors.Wrap(err, "小红书上传图片失败")
+		return nil, errors.Wrap(err, "小红书上传图片失败")
 	}
 
 	tags := content.Tags
@@ -90,10 +120,21 @@ func (p *PublishAction) Publish(ctx context.Context, content PublishImageContent
 
 	logrus.Infof("发布内容: title=%s, images=%v, tags=%v, schedule=%v, original=%v, visibility=%s, products=%v", content.Title, len(content.ImagePaths), tags, content.ScheduleTime, content.IsOriginal, content.Visibility, content.Products)
 
-	if err := submitPublish(ctx, page, content.Title, content.Content, tags, content.ScheduleTime, content.IsOriginal, content.Visibility, content.Products); err != nil {
-		return errors.Wrap(err, "小红书发布失败")
+	result, err := submitPublish(ctx, page, content.Title, content.Content, tags, content.ScheduleTime, content.IsOriginal, content.Visibility, content.Products)
+	if err != nil {
+		return nil, errors.Wrap(err, "小红书发布失败")
 	}
 
+	return result, nil
+}
+
+func (p *PublishAction) beginSubmission() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.submitted {
+		return errors.New("同一发布动作已经提交；禁止重复上传或点击发布")
+	}
+	p.submitted = true
 	return nil
 }
 
@@ -341,18 +382,18 @@ func waitForUploadComplete(page *rod.Page, expectedCount int) error {
 	return errors.Errorf("第%d张图片上传超时(60s)，请检查网络连接和图片大小", expectedCount)
 }
 
-func submitPublish(ctx context.Context, page *rod.Page, title, content string, tags []string, scheduleTime *time.Time, isOriginal bool, visibility string, products []string) error {
+func submitPublish(ctx context.Context, page *rod.Page, title, content string, tags []string, scheduleTime *time.Time, isOriginal bool, visibility string, products []string) (*PublishResult, error) {
 	titleElem, err := page.Element("div.d-input input")
 	if err != nil {
-		return errors.Wrap(err, "查找标题输入框失败")
+		return nil, errors.Wrap(err, "查找标题输入框失败")
 	}
 	if err := humanize.Type(ctx, titleElem, title); err != nil {
-		return errors.Wrap(err, "输入标题失败")
+		return nil, errors.Wrap(err, "输入标题失败")
 	}
 
 	humanize.Delay(ctx, humanize.AfterType)
 	if err := checkTitleMaxLength(page); err != nil {
-		return err
+		return nil, err
 	}
 	slog.Info("检查标题长度：通过")
 
@@ -360,68 +401,118 @@ func submitPublish(ctx context.Context, page *rod.Page, title, content string, t
 
 	contentElem, err := getContentElement(page, contentElemTimeout)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := humanize.Type(ctx, contentElem, content); err != nil {
-		return errors.Wrap(err, "输入正文失败")
+		return nil, errors.Wrap(err, "输入正文失败")
 	}
 	if err := waitAndClickTitleInput(titleElem); err != nil {
-		return err
+		return nil, err
 	}
 	if err := inputTags(ctx, contentElem, tags); err != nil {
-		return err
+		return nil, err
 	}
 
 	humanize.Delay(ctx, humanize.AfterType)
 
 	if err := checkContentMaxLength(page); err != nil {
-		return err
+		return nil, err
 	}
 	slog.Info("检查正文长度：通过")
 
 	if scheduleTime != nil {
 		if err := setSchedulePublish(ctx, page, *scheduleTime); err != nil {
-			return errors.Wrap(err, "设置定时发布失败")
+			return nil, errors.Wrap(err, "设置定时发布失败")
 		}
 		slog.Info("定时发布设置完成", "schedule_time", scheduleTime.Format("2006-01-02 15:04"))
 	}
 
 	if err := setVisibility(page, visibility); err != nil {
-		return errors.Wrap(err, "设置可见范围失败")
+		return nil, errors.Wrap(err, "设置可见范围失败")
 	}
 
 	// 处理原创声明：显式请求了原创但设置失败 → 报错中止，不静默发成非原创（避免"以为原创其实不是"）
 	if isOriginal {
 		if err := setOriginal(page); err != nil {
-			return errors.Wrap(err, "设置原创声明失败（已请求原创，中止发布）")
+			return nil, errors.Wrap(err, "设置原创声明失败（已请求原创，中止发布）")
 		}
 		slog.Info("已声明原创")
 	}
 
 	if err := bindProducts(ctx, page, products); err != nil {
-		return errors.Wrap(err, "绑定商品失败")
+		return nil, errors.Wrap(err, "绑定商品失败")
 	}
 
 	if err := clickPublishButton(page); err != nil {
-		return err
+		return nil, err
 	}
 
-	// 校验发布真的成功：成功后创作平台会跳转离开发布页；未跳转则判定失败，
-	// 消除"点了发布按钮就算成功"的假阳性。
-	return waitPublishSuccess(page, 15*time.Second)
+	// 离开编辑页不等于发布成功。只有受信 URL 给出稳定 feed_id 才返回成功。
+	return waitPublishResult(page, 15*time.Second)
 }
 
-// waitPublishSuccess 轮询等待发布成功的信号：小红书发布成功后会跳转离开发布表单页
-// （URL 不再含 /publish/publish）。超时仍未跳转 → 判定发布失败。
-func waitPublishSuccess(page *rod.Page, timeout time.Duration) error {
+// parsePublishedFeedURL 只接受仓库现有读取链路使用的公开笔记 URL。
+// 创作者后台的成功页结构未被稳定合同覆盖，因此不能从任意 query 猜 note ID。
+func parsePublishedFeedURL(rawURL string) (*PublishResult, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Port() != "" {
+		return nil, ErrPublishResultUnverifiable
+	}
+	if strings.ToLower(strings.TrimSuffix(parsed.Hostname(), ".")) != "www.xiaohongshu.com" {
+		return nil, ErrPublishResultUnverifiable
+	}
+
+	segments := strings.Split(strings.Trim(path.Clean(parsed.EscapedPath()), "/"), "/")
+	var feedID string
+	switch {
+	case len(segments) == 2 && segments[0] == "explore":
+		feedID = segments[1]
+	case len(segments) == 3 && segments[0] == "discovery" && segments[1] == "item":
+		feedID = segments[2]
+	default:
+		return nil, ErrPublishResultUnverifiable
+	}
+	unescapedID, err := url.PathUnescape(feedID)
+	if err != nil || !feedIDPattern.MatchString(unescapedID) {
+		return nil, ErrPublishResultUnverifiable
+	}
+
+	values := parsed.Query()["xsec_token"]
+	if len(values) > 1 {
+		return nil, ErrPublishResultUnverifiable
+	}
+	xsecToken := ""
+	if len(values) == 1 {
+		xsecToken = values[0]
+		if len(xsecToken) > 2048 || strings.TrimSpace(xsecToken) == "" || strings.ContainsAny(xsecToken, "\r\n\x00") {
+			return nil, ErrPublishResultUnverifiable
+		}
+	}
+
+	evidenceURL := (&url.URL{
+		Scheme: "https",
+		Host:   "www.xiaohongshu.com",
+		Path:   parsed.Path,
+	}).String()
+	return &PublishResult{
+		FeedID:      strings.ToLower(unescapedID),
+		XsecToken:   xsecToken,
+		EvidenceURL: evidenceURL,
+	}, nil
+}
+
+// waitPublishResult 等待可复验的稳定对象证据。离开编辑页但没有 feed_id 时保持 UNKNOWN。
+func waitPublishResult(page *rod.Page, timeout time.Duration) (*PublishResult, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if info, err := page.Info(); err == nil && !strings.Contains(info.URL, "/publish/publish") {
-			slog.Info("发布成功，已跳转离开发布页", "url", info.URL)
-			return nil
+		if info, err := page.Info(); err == nil {
+			if result, parseErr := parsePublishedFeedURL(info.URL); parseErr == nil {
+				slog.Info("发布结果已取得稳定对象 ID", "feed_id", result.FeedID, "evidence_url", result.EvidenceURL)
+				return result, nil
+			}
 		}
 		if time.Now().After(deadline) {
-			return errors.New("发布未确认成功：点击发布后未跳转离开发布页（可能校验未过或被拦截）")
+			return nil, errors.Wrap(ErrPublishResultUnverifiable, "点击发布后未取得受信 URL 中的稳定 feed_id；禁止重发")
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

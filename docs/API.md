@@ -177,11 +177,15 @@ DELETE /api/v1/login/cookies
 ```
 POST /api/v1/publish
 Content-Type: application/json
+X-Request-ID: request-20260913-001
+Idempotency-Key: publish-20260913-001
 ```
 
 **请求体**
 ```json
 {
+  "request_id": "request-20260913-001",
+  "idempotency_key": "publish-20260913-001",
   "title": "笔记标题",
   "content": "笔记内容",
   "images": [
@@ -194,6 +198,8 @@ Content-Type: application/json
 ```
 
 **请求参数说明:**
+- `request_id` (string, required): Huaxiaobao 请求唯一标识；也可通过 `X-Request-ID` 传入
+- `idempotency_key` (string, required): 幂等键；也可通过 `Idempotency-Key` 传入。同键只允许绑定完全相同的请求
 - `title` (string, required): 笔记标题
 - `content` (string, required): 笔记内容
 - `images` (array, required): 图片URL数组，至少包含一张图片
@@ -208,14 +214,25 @@ Content-Type: application/json
 {
   "success": true,
   "data": {
+    "request_id": "request-20260913-001",
+    "feed_id": "64f1a2b3c4d5e6f7a8b9c0d1",
+    "evidence_url": "https://www.xiaohongshu.com/explore/64f1a2b3c4d5e6f7a8b9c0d1",
     "title": "笔记标题",
     "content": "笔记内容",
     "images": 2,
-    "status": "发布完成"
+    "status": "VERIFIED"
   },
-  "message": "发布成功"
+  "message": "发布结果已取得稳定对象 ID"
 }
 ```
+
+只有受信的公开笔记 URL 能解析出稳定 `feed_id` 时才返回成功。若点击后离开编辑页但
+无法取得稳定 ID，接口返回 HTTP 202 和 `PUBLISH_RESULT_UNKNOWN`；调用方必须查询或转人工，
+不能再次发布。定时请求即使取得稳定 ID，也返回 `status: SCHEDULED`，不表示内容已经公开。
+若受信 URL 包含 `xsec_token`，原生响应会返回该值；Huaxiaobao 必须在自己的凭据边界内包装，
+不得把它写入普通日志或 Foundry。
+原生进程会缓存同一幂等键的结果以阻止双击；跨进程重启的持久幂等与结果查询仍由
+Huaxiaobao 负责，不能把本地缓存当作商业批准或持久账本。
 
 #### 3.2 发布视频内容
 

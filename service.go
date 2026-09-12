@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -22,7 +25,25 @@ import (
 // XiaohongshuService 小红书业务服务
 type XiaohongshuService struct {
 	logins loginSessions
+
+	publishMu       sync.Mutex
+	publishAttempts map[string]*publishAttempt
+	processImage    func([]string) ([]string, error)
+	publishImage    func(context.Context, xiaohongshu.PublishImageContent) (*xiaohongshu.PublishResult, error)
 }
+
+type publishAttempt struct {
+	fingerprint string
+	running     bool
+	response    *PublishResponse
+	err         error
+}
+
+var (
+	ErrPublishIdentityRequired = errors.New("发布请求必须包含 request_id 和 idempotency_key")
+	ErrPublishAttemptInFlight  = errors.New("相同幂等键的发布请求仍在执行；禁止重复提交")
+	ErrPublishIdentityConflict = errors.New("相同幂等键绑定了不同的发布请求")
+)
 
 // externalActionsEnabled 是原生写操作的最后一道安全开关。
 // Huaxiaobao 仍须在调用前校验具名批准；该开关本身不代表批准。
@@ -44,19 +65,26 @@ func requireExternalActionsEnabled() error {
 
 // NewXiaohongshuService 创建小红书服务实例
 func NewXiaohongshuService() *XiaohongshuService {
-	return &XiaohongshuService{}
+	service := &XiaohongshuService{
+		publishAttempts: make(map[string]*publishAttempt),
+	}
+	service.processImage = service.processImages
+	service.publishImage = service.publishContent
+	return service
 }
 
 // PublishRequest 发布请求
 type PublishRequest struct {
-	Title      string   `json:"title" binding:"required"`
-	Content    string   `json:"content" binding:"required"`
-	Images     []string `json:"images" binding:"required,min=1"`
-	Tags       []string `json:"tags,omitempty"`
-	ScheduleAt string   `json:"schedule_at,omitempty"` // 定时发布时间，ISO8601格式，为空则立即发布
-	IsOriginal bool     `json:"is_original,omitempty"` // 是否声明原创
-	Visibility string   `json:"visibility,omitempty"`  // 可见范围: "公开可见"(默认), "仅自己可见", "仅互关好友可见"
-	Products   []string `json:"products,omitempty"`    // 商品关键词列表，用于绑定带货商品
+	RequestID      string   `json:"request_id"`
+	IdempotencyKey string   `json:"idempotency_key"`
+	Title          string   `json:"title" binding:"required"`
+	Content        string   `json:"content" binding:"required"`
+	Images         []string `json:"images" binding:"required,min=1"`
+	Tags           []string `json:"tags,omitempty"`
+	ScheduleAt     string   `json:"schedule_at,omitempty"` // 定时发布时间，ISO8601格式，为空则立即发布
+	IsOriginal     bool     `json:"is_original,omitempty"` // 是否声明原创
+	Visibility     string   `json:"visibility,omitempty"`  // 可见范围: "公开可见"(默认), "仅自己可见", "仅互关好友可见"
+	Products       []string `json:"products,omitempty"`    // 商品关键词列表，用于绑定带货商品
 }
 
 // LoginStatusResponse 登录状态响应
@@ -75,10 +103,15 @@ type LoginQrcodeResponse struct {
 
 // PublishResponse 发布响应
 type PublishResponse struct {
-	Title   string `json:"title"`
-	Content string `json:"content"`
-	Images  int    `json:"images"`
-	Status  string `json:"status"`
+	RequestID    string `json:"request_id"`
+	FeedID       string `json:"feed_id"`
+	XsecToken    string `json:"xsec_token,omitempty"`
+	EvidenceURL  string `json:"evidence_url"`
+	Title        string `json:"title"`
+	Content      string `json:"content"`
+	Images       int    `json:"images"`
+	Status       string `json:"status"`
+	ScheduledFor string `json:"scheduled_for,omitempty"`
 }
 
 // PublishVideoRequest 发布视频请求（仅支持本地单个视频文件）
@@ -221,17 +254,36 @@ func (s *XiaohongshuService) waitScanInBackground(
 }
 
 // PublishContent 发布内容
-func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishRequest) (*PublishResponse, error) {
+func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishRequest) (response *PublishResponse, err error) {
 	if err := requireExternalActionsEnabled(); err != nil {
 		return nil, err
 	}
+	if req == nil || strings.TrimSpace(req.RequestID) == "" || strings.TrimSpace(req.IdempotencyKey) == "" {
+		return nil, ErrPublishIdentityRequired
+	}
+
+	fingerprint, err := publishRequestFingerprint(req)
+	if err != nil {
+		return nil, err
+	}
+	owner, previousResponse, previousErr := s.beginPublishAttempt(req.IdempotencyKey, fingerprint)
+	if !owner {
+		return previousResponse, previousErr
+	}
+	defer func() {
+		s.finishPublishAttempt(req.IdempotencyKey, response, err)
+	}()
 
 	// 验证标题长度（小红书限制：最大20个字）
 	if xhsutil.CalcTitleLength(req.Title) > 20 {
 		return nil, fmt.Errorf("标题长度超过限制")
 	}
 
-	imagePaths, err := s.processImages(req.Images)
+	processImage := s.processImage
+	if processImage == nil {
+		processImage = s.processImages
+	}
+	imagePaths, err := processImage(req.Images)
 	if err != nil {
 		return nil, err
 	}
@@ -272,19 +324,96 @@ func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishReq
 		Products:     req.Products,
 	}
 
-	if err := s.publishContent(ctx, content); err != nil {
+	publishImage := s.publishImage
+	if publishImage == nil {
+		publishImage = s.publishContent
+	}
+	result, err := publishImage(ctx, content)
+	if err != nil {
 		logrus.Errorf("发布内容失败: title=%s %v", content.Title, err)
+		if errors.Is(err, xiaohongshu.ErrPublishResultUnverifiable) {
+			return unknownPublishResponse(req), err
+		}
 		return nil, err
 	}
+	if result == nil || strings.TrimSpace(result.FeedID) == "" {
+		return unknownPublishResponse(req), xiaohongshu.ErrPublishResultUnverifiable
+	}
 
-	response := &PublishResponse{
-		Title:   req.Title,
-		Content: req.Content,
-		Images:  len(imagePaths),
-		Status:  "发布完成",
+	status := "VERIFIED"
+	if scheduleTime != nil {
+		status = "SCHEDULED"
+	}
+	response = &PublishResponse{
+		RequestID:    req.RequestID,
+		FeedID:       result.FeedID,
+		XsecToken:    result.XsecToken,
+		EvidenceURL:  result.EvidenceURL,
+		Title:        req.Title,
+		Content:      req.Content,
+		Images:       len(imagePaths),
+		Status:       status,
+		ScheduledFor: req.ScheduleAt,
 	}
 
 	return response, nil
+}
+
+func unknownPublishResponse(req *PublishRequest) *PublishResponse {
+	return &PublishResponse{
+		RequestID:    req.RequestID,
+		Status:       "UNKNOWN",
+		ScheduledFor: req.ScheduleAt,
+	}
+}
+
+func publishRequestFingerprint(req *PublishRequest) (string, error) {
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("生成发布请求指纹失败: %w", err)
+	}
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(raw)), nil
+}
+
+func clonePublishResponse(response *PublishResponse) *PublishResponse {
+	if response == nil {
+		return nil
+	}
+	cloned := *response
+	return &cloned
+}
+
+func (s *XiaohongshuService) beginPublishAttempt(idempotencyKey, fingerprint string) (bool, *PublishResponse, error) {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	if s.publishAttempts == nil {
+		s.publishAttempts = make(map[string]*publishAttempt)
+	}
+
+	key := strings.TrimSpace(idempotencyKey)
+	if previous, ok := s.publishAttempts[key]; ok {
+		if previous.fingerprint != fingerprint {
+			return false, nil, ErrPublishIdentityConflict
+		}
+		if previous.running {
+			return false, nil, ErrPublishAttemptInFlight
+		}
+		return false, clonePublishResponse(previous.response), previous.err
+	}
+	s.publishAttempts[key] = &publishAttempt{fingerprint: fingerprint, running: true}
+	return true, nil, nil
+}
+
+func (s *XiaohongshuService) finishPublishAttempt(idempotencyKey string, response *PublishResponse, err error) {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	attempt := s.publishAttempts[strings.TrimSpace(idempotencyKey)]
+	if attempt == nil {
+		return
+	}
+	attempt.running = false
+	attempt.response = clonePublishResponse(response)
+	attempt.err = err
 }
 
 // processImages 处理图片列表，支持URL下载和本地路径
@@ -294,7 +423,7 @@ func (s *XiaohongshuService) processImages(images []string) ([]string, error) {
 }
 
 // publishContent 执行内容发布
-func (s *XiaohongshuService) publishContent(ctx context.Context, content xiaohongshu.PublishImageContent) error {
+func (s *XiaohongshuService) publishContent(ctx context.Context, content xiaohongshu.PublishImageContent) (*xiaohongshu.PublishResult, error) {
 	b := newBrowser()
 	defer b.Close()
 
@@ -303,10 +432,10 @@ func (s *XiaohongshuService) publishContent(ctx context.Context, content xiaohon
 
 	action, err := xiaohongshu.NewPublishImageAction(page)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return action.Publish(ctx, content)
+	return action.PublishWithResult(ctx, content)
 }
 
 // PublishVideo 发布视频（本地文件）

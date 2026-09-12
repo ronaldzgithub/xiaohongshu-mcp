@@ -888,7 +888,7 @@ After successful connection, you can use the following MCP tools:
 - `check_login_status` - Check RedNote login status (no parameters)
 - `get_login_qrcode` - Get login QR code, returns Base64 image and timeout (no parameters)
 - `delete_cookies` - Delete cookies file, reset login status, requires re-login after deletion (no parameters)
-- `publish_content` - Publish image-text content to RedNote (required: title, content, images)
+- `publish_content` - Publish image-text content to RedNote (required: request_id, idempotency_key, title, content, images; confirmed only with a stable feed_id)
   - `images`: Image path list (minimum 1), supports HTTP links or local absolute paths, local paths recommended
   - `tags`: Topic tags list (optional), e.g. `["food", "travel", "lifestyle"]`
   - `schedule_at`: Scheduled publish time (optional), ISO8601 format, supports 1 hour to 14 days ahead
