@@ -193,7 +193,19 @@ func (s *AppServer) handlePublishContent(ctx context.Context, args map[string]in
 		}
 	}
 
-	resultText := fmt.Sprintf("内容发布结果已验证: %+v", result)
+	// xsec_token is reusable native access material.  The HTTP transport may
+	// return it to Huaxiaobao so that the credential boundary can immediately
+	// exchange it for an opaque, scoped access reference.  MCP text is ordinary
+	// tool output and may be persisted in transcripts or logs, so it must never
+	// stringify the full response.
+	resultText := fmt.Sprintf(
+		"内容发布结果已验证: request_id=%s feed_id=%s status=%s evidence_url=%s scheduled_for=%s",
+		result.RequestID,
+		result.FeedID,
+		result.Status,
+		result.EvidenceURL,
+		result.ScheduledFor,
+	)
 	return &MCPToolResult{
 		Content: []MCPContent{{
 			Type: "text",
