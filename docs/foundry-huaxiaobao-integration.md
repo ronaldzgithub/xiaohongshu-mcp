@@ -72,6 +72,10 @@ Windows 使用仓库内的 `headless_browser v0.4.0` 最小补丁版（原 MIT �
   `is_logged_in=false`；adapter 返回 `BLOCKED/ACCOUNT_LOGIN_REQUIRED`、
   `external_action_performed=false`。请求结束后没有遗留该固定浏览器进程，也不再出现
   Defender error 225。该结果不是账号或平台现场验证。
+- 当前加固 Windows 主机的 `%LOCALAPPDATA%` 缓存路径会在进程创建前触发 Side-by-Side event 33；
+  同一精确二进制和标准版本程序集布局放入受治理的 E 盘执行边界后可启动并得到上述结果。
+  因此该主机的部署规格必须同时钉死 `XHS_BROWSER_BINARY` 与
+  `XHS_BROWSER_BINARY_SHA256`，不能依赖普通用户缓存，也不能通过关闭终端安全策略规避。
 - 合同：原生 MCP/HTTP 合同存在；Huaxiaobao 可调用账号状态、未读数和通知列表三个 exact-version adapter；通知列表按真实清未读副作用 fail closed，外发合同仍未开放。
 - 真实账号：未提供，未验证。
 - 获批动作：未执行。
