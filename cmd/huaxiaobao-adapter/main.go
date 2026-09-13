@@ -26,6 +26,8 @@ type adapterRequest struct {
 	OperationID   string `json:"operation_id"`
 	Capability    string `json:"capability"`
 	AccountRef    string `json:"account_ref"`
+	Tab           string `json:"tab,omitempty"`
+	Limit         int    `json:"limit,omitempty"`
 }
 
 type adapterError struct {
@@ -58,6 +60,11 @@ type nativeStatusEnvelope struct {
 	} `json:"data"`
 }
 
+type nativeDataEnvelope struct {
+	Success bool            `json:"success"`
+	Data    json.RawMessage `json:"data"`
+}
+
 func hashRequest(req adapterRequest) string {
 	raw, _ := json.Marshal(req)
 	sum := sha256.Sum256(raw)
@@ -72,6 +79,17 @@ func stableAccountObjectRef(accountRef string) string {
 func stableNativeSubjectRef(userID string) string {
 	sum := sha256.Sum256([]byte(userID))
 	return "xiaohongshu:subject:" + hex.EncodeToString(sum[:12])
+}
+
+func stableNativeObjectRef(accountRef, object string) string {
+	sum := sha256.Sum256([]byte(accountRef + "\x00" + object))
+	return "xiaohongshu:object:" + hex.EncodeToString(sum[:12])
+}
+
+func jsonHash(value any) string {
+	raw, _ := json.Marshal(value)
+	sum := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func validatedBaseURL(value string) (string, error) {
@@ -114,10 +132,29 @@ func execute(ctx context.Context, client *http.Client, baseURL, authToken string
 		result.Error = &adapterError{Code: "INVALID_REQUEST", Message: "operation_id and account_ref are required"}
 		return result
 	}
-	if req.Capability != "account.status" {
+	if req.Capability != "account.status" && req.Capability != "notifications.unread" && req.Capability != "notifications.list" {
 		result.Status = "REJECTED"
-		result.Error = &adapterError{Code: "CAPABILITY_NOT_AVAILABLE", Message: "only account.status is available on the safe adapter"}
+		result.Error = &adapterError{Code: "CAPABILITY_NOT_AVAILABLE", Message: "capability is not available on the safe adapter"}
 		return result
+	}
+	if req.Capability != "notifications.list" && (strings.TrimSpace(req.Tab) != "" || req.Limit != 0) {
+		result.Status = "REJECTED"
+		result.Error = &adapterError{Code: "INVALID_REQUEST", Message: "tab and limit are only valid for notifications.list"}
+		return result
+	}
+	if req.Capability == "notifications.list" {
+		result.SideEffect = "read_marks_selected_notifications_seen"
+		result.RetrySafe = false
+		if req.Tab != "mentions" && req.Tab != "likes" && req.Tab != "connections" {
+			result.Status = "REJECTED"
+			result.Error = &adapterError{Code: "INVALID_NOTIFICATION_TAB", Message: "tab must be mentions, likes, or connections"}
+			return result
+		}
+		if req.Limit < 1 || req.Limit > 100 {
+			result.Status = "REJECTED"
+			result.Error = &adapterError{Code: "INVALID_NOTIFICATION_LIMIT", Message: "limit must be between 1 and 100"}
+			return result
+		}
 	}
 	if strings.TrimSpace(authToken) == "" {
 		result.Error = &adapterError{Code: "CONFIGURATION_REQUIRED", Message: "XHS_ADAPTER_AUTH_TOKEN is required"}
@@ -130,28 +167,9 @@ func execute(ctx context.Context, client *http.Client, baseURL, authToken string
 		return result
 	}
 
-	nativeReq, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		validatedURL+"/api/v1/login/status", nil)
-	if err != nil {
-		result.Error = &adapterError{Code: "NATIVE_REQUEST_FAILED", Message: "could not construct native account request"}
-		return result
-	}
-	nativeReq.Header.Set("Authorization", "Bearer "+authToken)
-
-	resp, err := client.Do(nativeReq)
-	if err != nil {
-		result.Error = &adapterError{Code: "NATIVE_UNAVAILABLE", Message: "native account service is unavailable"}
-		return result
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		result.Error = &adapterError{Code: "NATIVE_HTTP_ERROR", Message: fmt.Sprintf("native service returned HTTP %d", resp.StatusCode)}
-		return result
-	}
-
 	var native nativeStatusEnvelope
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&native); err != nil {
-		result.Error = &adapterError{Code: "NATIVE_RESPONSE_INVALID", Message: "native account response is invalid"}
+	if nativeErr := nativeGET(ctx, client, validatedURL, authToken, "/api/v1/login/status", &native); nativeErr != nil {
+		result.Error = nativeErr
 		return result
 	}
 	if !native.Success {
@@ -163,21 +181,76 @@ func execute(ctx context.Context, client *http.Client, baseURL, authToken string
 	result.Details = map[string]any{
 		"is_logged_in": native.Data.IsLoggedIn,
 	}
-	if native.Data.IsLoggedIn {
-		if strings.TrimSpace(native.Data.UserID) == "" {
-			result.Error = &adapterError{Code: "NATIVE_IDENTITY_MISSING", Message: "logged-in account lacks a verifiable subject"}
-			return result
-		}
-		result.Details = map[string]any{
-			"is_logged_in":       true,
-			"native_subject_ref": stableNativeSubjectRef(native.Data.UserID),
-		}
-		result.Status = "READY"
-	} else {
+	if !native.Data.IsLoggedIn {
 		result.Status = "BLOCKED"
 		result.Error = &adapterError{Code: "ACCOUNT_LOGIN_REQUIRED", Message: "account owner login is required"}
+		return result
 	}
+	if strings.TrimSpace(native.Data.UserID) == "" {
+		result.Error = &adapterError{Code: "NATIVE_IDENTITY_MISSING", Message: "logged-in account lacks a verifiable subject"}
+		return result
+	}
+	subjectRef := stableNativeSubjectRef(native.Data.UserID)
+	if req.Capability == "account.status" {
+		result.Details = map[string]any{
+			"is_logged_in":       true,
+			"native_subject_ref": subjectRef,
+		}
+		result.Status = "READY"
+		return result
+	}
+
+	path := "/api/v1/notifications/unread"
+	objectKey := "notifications:unread"
+	if req.Capability == "notifications.list" {
+		query := url.Values{}
+		query.Set("tab", req.Tab)
+		query.Set("limit", fmt.Sprintf("%d", req.Limit))
+		path = "/api/v1/notifications/list?" + query.Encode()
+		objectKey = "notifications:list:" + req.Tab
+	}
+	var envelope nativeDataEnvelope
+	if nativeErr := nativeGET(ctx, client, validatedURL, authToken, path, &envelope); nativeErr != nil {
+		result.Error = nativeErr
+		return result
+	}
+	if !envelope.Success || len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+		result.Error = &adapterError{Code: "NATIVE_STATUS_FAILED", Message: "native notification read did not succeed"}
+		return result
+	}
+	var data any
+	if err := json.Unmarshal(envelope.Data, &data); err != nil {
+		result.Error = &adapterError{Code: "NATIVE_RESPONSE_INVALID", Message: "native notification response is invalid"}
+		return result
+	}
+	result.ObjectRef = stableNativeObjectRef(req.AccountRef, objectKey)
+	result.Details = map[string]any{
+		"native_subject_ref":   subjectRef,
+		"native_readback":      data,
+		"native_readback_hash": jsonHash(data),
+	}
+	result.Status = "READY"
 	return result
+}
+
+func nativeGET(ctx context.Context, client *http.Client, baseURL, authToken, path string, target any) *adapterError {
+	nativeReq, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+	if err != nil {
+		return &adapterError{Code: "NATIVE_REQUEST_FAILED", Message: "could not construct native request"}
+	}
+	nativeReq.Header.Set("Authorization", "Bearer "+authToken)
+	resp, err := client.Do(nativeReq)
+	if err != nil {
+		return &adapterError{Code: "NATIVE_UNAVAILABLE", Message: "native service is unavailable"}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return &adapterError{Code: "NATIVE_HTTP_ERROR", Message: fmt.Sprintf("native service returned HTTP %d", resp.StatusCode)}
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(target); err != nil {
+		return &adapterError{Code: "NATIVE_RESPONSE_INVALID", Message: "native response is invalid"}
+	}
+	return nil
 }
 
 func descriptor() map[string]any {
@@ -188,8 +261,21 @@ func descriptor() map[string]any {
 		"capabilities": []map[string]any{
 			{
 				"name":        "account.status",
+				"version":     "1.0.0",
 				"side_effect": "read_only",
 				"retry_safe":  true,
+			},
+			{
+				"name":        "notifications.unread",
+				"version":     "1.0.0",
+				"side_effect": "read_only",
+				"retry_safe":  true,
+			},
+			{
+				"name":        "notifications.list",
+				"version":     "1.0.0",
+				"side_effect": "read_marks_selected_notifications_seen",
+				"retry_safe":  false,
 			},
 		},
 		"external_actions_available": false,

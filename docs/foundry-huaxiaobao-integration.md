@@ -27,7 +27,7 @@ Foundry 拥有销售目标、内容计划、客户/商机语义、预算、报�
 
 ## 安全 adapter surface 与外发门禁
 
-`go run ./cmd/huaxiaobao-adapter describe` 输出机器可读能力描述；`go run ./cmd/huaxiaobao-adapter execute` 从标准输入读取 `foundry.huaxiaobao.tool-request.v1` JSON。当前只开放 `account.status`，它调用原生 `/api/v1/login/status` 并返回稳定账号对象引用、请求哈希和 `READY`/`BLOCKED`/`UNKNOWN` typed result。`XHS_ADAPTER_BASE_URL` 默认是本机 `http://127.0.0.1:18060`；`XHS_ADAPTER_AUTH_TOKEN` 必须通过 Huaxiaobao 进程环境注入，adapter 不接受请求内凭据，也不输出令牌。
+`go run ./cmd/huaxiaobao-adapter describe` 输出机器可读能力描述；`go run ./cmd/huaxiaobao-adapter execute` 从标准输入读取 `foundry.huaxiaobao.tool-request.v1` JSON。安全 surface 开放 exact `account.status@1.0.0`、`notifications.unread@1.0.0` 和 `notifications.list@1.0.0`。三者均先调用原生 `/api/v1/login/status` 复验登录及稳定账号主体；通知结果附带原生 readback 哈希。`notifications.list` 强制绑定一个分区和 1–100 的上限，回执固定标记 `read_marks_selected_notifications_seen`、`retry_safe=false`，UNKNOWN 时调用方不得重发。`XHS_ADAPTER_BASE_URL` 默认是本机 `http://127.0.0.1:18060`；`XHS_ADAPTER_AUTH_TOKEN` 必须通过 Huaxiaobao 进程环境注入，adapter 不接受请求内凭据，也不输出令牌。
 
 原生发布、评论、回复、点赞和收藏服务新增 `XHS_ENABLE_EXTERNAL_ACTIONS` fail-closed 门禁。默认、空值和未知值全部拒绝，并且在启动浏览器或访问账号前返回；只有 `1`、`true`、`yes`、`on` 显式开启。该兼容开关不等于 Foundry 具名批准，当前安全 adapter 仍完全不暴露外发能力。
 
@@ -72,15 +72,13 @@ Windows 使用仓库内的 `headless_browser v0.4.0` 最小补丁版（原 MIT �
   `is_logged_in=false`；adapter 返回 `BLOCKED/ACCOUNT_LOGIN_REQUIRED`、
   `external_action_performed=false`。请求结束后没有遗留该固定浏览器进程，也不再出现
   Defender error 225。该结果不是账号或平台现场验证。
-- 合同：原生 MCP/HTTP 合同存在；已增加 Huaxiaobao 可调用的 `account.status` 最小版本化 adapter，外发合同仍未开放。
+- 合同：原生 MCP/HTTP 合同存在；Huaxiaobao 可调用账号状态、未读数和通知列表三个 exact-version adapter；通知列表按真实清未读副作用 fail closed，外发合同仍未开放。
 - 真实账号：未提供，未验证。
 - 获批动作：未执行。
 - 人工 ACK、服务重启、重复/迟到结果、权限撤销和检查点恢复：尚无真实证据。
 
-本次补丁依赖模块 `go test ./...` 以及根仓
-`go test . ./browser ./cmd/huaxiaobao-adapter` 通过。`go test ./...` 仅在既有
-`cookies/TestGetCookiesFilePath/本地没有时兜底到tmp旧路径` 上失败：Windows
-短路径临时目录期望与工作目录中的 `cookies.json` 选择不同；新增根包和 adapter
-测试均通过。该环境差异不代表全量测试通过，也未被改写为新功能证据。
+当前分支使用 Go 1.27.0 在 Windows 运行 `go test ./...` 以及
+`go test . ./browser ./cmd/huaxiaobao-adapter` 均通过。通知 adapter 测试使用本机
+`httptest` 原生接口替身，证明合同、登录前置、哈希和副作用分类，不是账号或平台现场证据。
 
 不得用 fixture、页面跳转或本机健康检查声称真实获客、客户验收或收入。
