@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -91,7 +92,9 @@ func TestExecuteUnreadChecksExactAccountThenReadsWithoutSideEffect(t *testing.T)
 		case "/api/v1/notifications/unread":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"success": true,
-				"data":    map[string]any{"mentions": 2, "likes": 3, "connections": 1},
+				"data": map[string]any{
+					"data": map[string]any{"mentions": 2, "likes": 3, "connections": 1, "unread": 6},
+				},
 			})
 		default:
 			http.NotFound(w, r)
@@ -129,8 +132,16 @@ func TestExecuteNotificationListDeclaresUnreadMutationAndNoRetry(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success": true,
 			"data": map[string]any{
-				"tab":   "mentions",
-				"items": []map[string]any{{"comment_id": "stable-comment-1"}},
+				"data": map[string]any{
+					"tab": "mentions",
+					"items": []map[string]any{{
+						"id": "notification-1", "comment_id": "stable-comment-1",
+						"feed_id": "feed-1", "feed_xsec_token": "feed-secret",
+						"from": map[string]any{
+							"user_id": "raw-user-id", "nickname": "private-name", "xsec_token": "user-secret",
+						},
+					}},
+				},
 			},
 		})
 	}))
@@ -147,6 +158,12 @@ func TestExecuteNotificationListDeclaresUnreadMutationAndNoRetry(t *testing.T) {
 	assert.False(t, result.RetrySafe)
 	assert.False(t, result.ExternalActionPerformed)
 	assert.Equal(t, 2, requests)
+	serialized := fmt.Sprint(result.Details)
+	for _, forbidden := range []string{"raw-user-id", "private-name", "feed-secret", "user-secret", "stable-comment-1", "feed-1"} {
+		assert.NotContains(t, serialized, forbidden)
+	}
+	assert.Contains(t, serialized, "xiaohongshu:comment:")
+	assert.Contains(t, serialized, "xiaohongshu:feed:")
 }
 
 func TestExecuteNotificationListRejectsAmbiguousScopeBeforeNativeCall(t *testing.T) {
@@ -201,4 +218,37 @@ func TestDescriptorKeepsNotificationSideEffectsVersioned(t *testing.T) {
 	assert.True(t, capabilities[1]["retry_safe"].(bool))
 	assert.Equal(t, "read_marks_selected_notifications_seen", capabilities[2]["side_effect"])
 	assert.False(t, capabilities[2]["retry_safe"].(bool))
+}
+
+func TestNativeResponseRejectsOversizeAndTrailingJSON(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		suffix string
+	}{
+		{name: "oversize", suffix: strings.Repeat("x", (1<<20)+1)},
+		{name: "second value", suffix: ` {"unexpected":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/api/v1/login/status" {
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"success": true,
+						"data":    map[string]any{"is_logged_in": true, "user_id": "native-user"},
+					})
+					return
+				}
+				_, _ = fmt.Fprint(w, `{"success":true,"data":{"data":{"mentions":1,"likes":0,"connections":0,"unread":1}}}`+tc.suffix)
+			}))
+			defer server.Close()
+
+			req := validRequest()
+			req.Capability = "notifications.unread"
+			result := execute(context.Background(), server.Client(), server.URL, "secret", req)
+
+			require.NotNil(t, result.Error)
+			assert.Equal(t, "UNKNOWN", result.Status)
+			assert.Equal(t, "NATIVE_RESPONSE_INVALID", result.Error.Code)
+		})
+	}
 }

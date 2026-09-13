@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -61,8 +62,31 @@ type nativeStatusEnvelope struct {
 }
 
 type nativeDataEnvelope struct {
-	Success bool            `json:"success"`
-	Data    json.RawMessage `json:"data"`
+	Success bool `json:"success"`
+	Data    struct {
+		Data json.RawMessage `json:"data"`
+	} `json:"data"`
+}
+
+type nativeNotificationItem struct {
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	Title       string `json:"title"`
+	Time        int64  `json:"time"`
+	CommentID   string `json:"comment_id"`
+	CommentText string `json:"comment_text"`
+	Liked       bool   `json:"liked"`
+	FeedID      string `json:"feed_id"`
+	FeedTitle   string `json:"feed_title"`
+	From        struct {
+		UserID string `json:"user_id"`
+	} `json:"from"`
+}
+
+type nativeNotificationList struct {
+	Tab      string                   `json:"tab"`
+	Filtered int                      `json:"filtered"`
+	Items    []nativeNotificationItem `json:"items"`
 }
 
 func hashRequest(req adapterRequest) string {
@@ -84,6 +108,14 @@ func stableNativeSubjectRef(userID string) string {
 func stableNativeObjectRef(accountRef, object string) string {
 	sum := sha256.Sum256([]byte(accountRef + "\x00" + object))
 	return "xiaohongshu:object:" + hex.EncodeToString(sum[:12])
+}
+
+func opaqueNativeRef(accountRef, kind, nativeID string) string {
+	if strings.TrimSpace(nativeID) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(accountRef + "\x00" + kind + "\x00" + nativeID))
+	return "xiaohongshu:" + kind + ":" + hex.EncodeToString(sum[:12])
 }
 
 func jsonHash(value any) string {
@@ -214,14 +246,49 @@ func execute(ctx context.Context, client *http.Client, baseURL, authToken string
 		result.Error = nativeErr
 		return result
 	}
-	if !envelope.Success || len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+	if !envelope.Success || len(envelope.Data.Data) == 0 || string(envelope.Data.Data) == "null" {
 		result.Error = &adapterError{Code: "NATIVE_STATUS_FAILED", Message: "native notification read did not succeed"}
 		return result
 	}
 	var data any
-	if err := json.Unmarshal(envelope.Data, &data); err != nil {
-		result.Error = &adapterError{Code: "NATIVE_RESPONSE_INVALID", Message: "native notification response is invalid"}
-		return result
+	if req.Capability == "notifications.unread" {
+		var unread struct {
+			Mentions    int `json:"mentions"`
+			Likes       int `json:"likes"`
+			Connections int `json:"connections"`
+			Unread      int `json:"unread"`
+		}
+		if err := decodeJSONBytes(envelope.Data.Data, &unread, true); err != nil {
+			result.Error = &adapterError{Code: "NATIVE_RESPONSE_INVALID", Message: "native unread response is invalid"}
+			return result
+		}
+		data = unread
+	} else {
+		var nativeList nativeNotificationList
+		if err := decodeJSONBytes(envelope.Data.Data, &nativeList, false); err != nil || nativeList.Tab != req.Tab {
+			result.Error = &adapterError{Code: "NATIVE_RESPONSE_INVALID", Message: "native notification list is invalid"}
+			return result
+		}
+		items := make([]map[string]any, 0, len(nativeList.Items))
+		for _, item := range nativeList.Items {
+			items = append(items, map[string]any{
+				"notification_ref": opaqueNativeRef(req.AccountRef, "notification", item.ID),
+				"type":             item.Type,
+				"title":            item.Title,
+				"time":             item.Time,
+				"from_ref":         opaqueNativeRef(req.AccountRef, "subject", item.From.UserID),
+				"comment_ref":      opaqueNativeRef(req.AccountRef, "comment", item.CommentID),
+				"comment_text":     item.CommentText,
+				"liked":            item.Liked,
+				"feed_ref":         opaqueNativeRef(req.AccountRef, "feed", item.FeedID),
+				"feed_title":       item.FeedTitle,
+			})
+		}
+		data = map[string]any{
+			"tab":      nativeList.Tab,
+			"filtered": nativeList.Filtered,
+			"items":    items,
+		}
 	}
 	result.ObjectRef = stableNativeObjectRef(req.AccountRef, objectKey)
 	result.Details = map[string]any{
@@ -247,8 +314,37 @@ func nativeGET(ctx context.Context, client *http.Client, baseURL, authToken, pat
 	if resp.StatusCode != http.StatusOK {
 		return &adapterError{Code: "NATIVE_HTTP_ERROR", Message: fmt.Sprintf("native service returned HTTP %d", resp.StatusCode)}
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(target); err != nil {
+	if err := decodeBoundedJSON(resp.Body, 1<<20, target, false); err != nil {
 		return &adapterError{Code: "NATIVE_RESPONSE_INVALID", Message: "native response is invalid"}
+	}
+	return nil
+}
+
+func decodeBoundedJSON(reader io.Reader, limit int64, target any, disallowUnknown bool) error {
+	raw, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(raw)) > limit {
+		return fmt.Errorf("JSON exceeds %d bytes", limit)
+	}
+	return decodeJSONBytes(raw, target, disallowUnknown)
+}
+
+func decodeJSONBytes(raw []byte, target any, disallowUnknown bool) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if disallowUnknown {
+		decoder.DisallowUnknownFields()
+	}
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("multiple JSON values are not allowed")
+		}
+		return err
 	}
 	return nil
 }
@@ -306,9 +402,7 @@ func run(args []string, input io.Reader) int {
 	}
 
 	var req adapterRequest
-	decoder := json.NewDecoder(io.LimitReader(input, 1<<20))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeBoundedJSON(input, 1<<20, &req, true); err != nil {
 		_ = writeJSON(adapterResponse{
 			SchemaVersion: responseSchema,
 			ExecutorID:    executorID,

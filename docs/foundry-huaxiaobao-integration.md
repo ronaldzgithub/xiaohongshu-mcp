@@ -27,7 +27,7 @@ Foundry 拥有销售目标、内容计划、客户/商机语义、预算、报�
 
 ## 安全 adapter surface 与外发门禁
 
-`go run ./cmd/huaxiaobao-adapter describe` 输出机器可读能力描述；`go run ./cmd/huaxiaobao-adapter execute` 从标准输入读取 `foundry.huaxiaobao.tool-request.v1` JSON。安全 surface 开放 exact `account.status@1.0.0`、`notifications.unread@1.0.0` 和 `notifications.list@1.0.0`。三者均先调用原生 `/api/v1/login/status` 复验登录及稳定账号主体；通知结果附带原生 readback 哈希。`notifications.list` 强制绑定一个分区和 1–100 的上限，回执固定标记 `read_marks_selected_notifications_seen`、`retry_safe=false`，UNKNOWN 时调用方不得重发。`XHS_ADAPTER_BASE_URL` 默认是本机 `http://127.0.0.1:18060`；`XHS_ADAPTER_AUTH_TOKEN` 必须通过 Huaxiaobao 进程环境注入，adapter 不接受请求内凭据，也不输出令牌。
+`go run ./cmd/huaxiaobao-adapter describe` 输出机器可读能力描述；`go run ./cmd/huaxiaobao-adapter execute` 从标准输入读取 `foundry.huaxiaobao.tool-request.v1` JSON。安全 surface 开放 exact `account.status@1.0.0`、`notifications.unread@1.0.0` 和 `notifications.list@1.0.0`。三者均先调用原生 `/api/v1/login/status` 复验登录及稳定账号主体；通知结果经过 typed allowlist，只输出必要内容和账号域内 opaque subject/comment/feed 引用，原生 `user_id`、`xsec_token`、`feed_xsec_token` 不离开工具边界；readback 哈希也针对清洗后的结果。`notifications.list` 强制绑定一个分区和 1–100 的上限，回执固定标记 `read_marks_selected_notifications_seen`、`retry_safe=false`，UNKNOWN 时调用方不得重发。请求及原生响应都要求单一、完整且不超过 1 MiB 的 JSON，超限或尾随内容失败关闭。`XHS_ADAPTER_BASE_URL` 默认是本机 `http://127.0.0.1:18060`；`XHS_ADAPTER_AUTH_TOKEN` 必须通过 Huaxiaobao 进程环境注入，adapter 不接受请求内凭据，也不输出令牌。
 
 原生发布、评论、回复、点赞和收藏服务新增 `XHS_ENABLE_EXTERNAL_ACTIONS` fail-closed 门禁。默认、空值和未知值全部拒绝，并且在启动浏览器或访问账号前返回；只有 `1`、`true`、`yes`、`on` 显式开启。该兼容开关不等于 Foundry 具名批准，当前安全 adapter 仍完全不暴露外发能力。
 
