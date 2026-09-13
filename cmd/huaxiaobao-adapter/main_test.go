@@ -46,6 +46,28 @@ func TestExecuteAccountStatusUsesNativeReadOnlyEndpoint(t *testing.T) {
 	assert.NotContains(t, fmt.Sprint(result.Details), "native-user")
 }
 
+func TestAccountSubjectReferenceIsScopedToOpaqueAccount(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data":    map[string]any{"is_logged_in": true, "user_id": "same-native-user"},
+		})
+	}))
+	defer server.Close()
+
+	first := validRequest()
+	second := validRequest()
+	second.AccountRef = "another-opaque-account"
+	firstResult := execute(context.Background(), server.Client(), server.URL, "secret", first)
+	secondResult := execute(context.Background(), server.Client(), server.URL, "secret", second)
+
+	firstSubject := firstResult.Details.(map[string]any)["native_subject_ref"]
+	secondSubject := secondResult.Details.(map[string]any)["native_subject_ref"]
+	assert.NotEqual(t, firstSubject, secondSubject)
+	assert.NotContains(t, fmt.Sprint(firstSubject), "same-native-user")
+}
+
 func TestExecuteRejectsRemoteHTTPBeforeSendingCredential(t *testing.T) {
 	result := execute(context.Background(), http.DefaultClient, "http://example.com", "secret", validRequest())
 

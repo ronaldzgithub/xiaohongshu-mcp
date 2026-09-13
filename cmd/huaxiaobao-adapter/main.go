@@ -100,11 +100,6 @@ func stableAccountObjectRef(accountRef string) string {
 	return "xiaohongshu:account:" + hex.EncodeToString(sum[:8])
 }
 
-func stableNativeSubjectRef(userID string) string {
-	sum := sha256.Sum256([]byte(userID))
-	return "xiaohongshu:subject:" + hex.EncodeToString(sum[:12])
-}
-
 func stableNativeObjectRef(accountRef, object string) string {
 	sum := sha256.Sum256([]byte(accountRef + "\x00" + object))
 	return "xiaohongshu:object:" + hex.EncodeToString(sum[:12])
@@ -222,7 +217,7 @@ func execute(ctx context.Context, client *http.Client, baseURL, authToken string
 		result.Error = &adapterError{Code: "NATIVE_IDENTITY_MISSING", Message: "logged-in account lacks a verifiable subject"}
 		return result
 	}
-	subjectRef := stableNativeSubjectRef(native.Data.UserID)
+	subjectRef := opaqueNativeRef(req.AccountRef, "subject", native.Data.UserID)
 	if req.Capability == "account.status" {
 		result.Details = map[string]any{
 			"is_logged_in":       true,
