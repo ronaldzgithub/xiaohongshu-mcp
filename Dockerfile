@@ -31,8 +31,12 @@ WORKDIR /app
 # 1. 安装内置浏览器运行依赖（Chromium 库）和中文字体
 RUN --mount=type=cache,id=xhs-apt-lists,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,id=xhs-apt-archives,target=/var/cache/apt,sharing=locked \
-    apt-get -o Acquire::Retries=10 update && \
-    apt-get -o Acquire::Retries=10 install -y --fix-missing --no-install-recommends \
+    for attempt in 1 2 3 4 5; do \
+      apt-get -o Acquire::Retries=10 update && break; \
+      test "$attempt" = 5 && exit 1; sleep 2; \
+    done && \
+    for attempt in 1 2 3 4 5; do \
+      apt-get -o Acquire::Retries=10 install -y --fix-missing --no-install-recommends \
     ca-certificates \
     curl \
     fonts-liberation \
@@ -79,8 +83,10 @@ RUN --mount=type=cache,id=xhs-apt-lists,target=/var/lib/apt/lists,sharing=locked
     lsb-release \
     tini \
     wget \
-    xdg-utils \
-    xz-utils
+      xdg-utils \
+      xz-utils && break; \
+      test "$attempt" = 5 && exit 1; sleep 2; \
+    done
 
 # 2. 创建目录并设置权限。
 RUN mkdir -p /app/data/home /app/data/config /app/images && \
