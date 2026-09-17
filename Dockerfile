@@ -81,16 +81,24 @@ RUN --mount=type=cache,id=xhs-apt-lists,target=/var/lib/apt/lists,sharing=locked
     libxss1 \
     libxtst6 \
     lsb-release \
-    novnc \
-    openbox \
     tini \
-    websockify \
     wget \
-    x11-utils \
-    x11vnc \
-    xvfb \
       xdg-utils \
       xz-utils && break; \
+      test "$attempt" = 5 && exit 1; sleep 2; \
+    done
+
+# noVNC lives in its own layer so the large browser-runtime dependency layer
+# remains reusable when the visual handover stack changes.
+RUN --mount=type=cache,id=xhs-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,id=xhs-apt-archives,target=/var/cache/apt,sharing=locked \
+    for attempt in 1 2 3 4 5; do \
+      apt-get -o Acquire::Retries=10 update && break; \
+      test "$attempt" = 5 && exit 1; sleep 2; \
+    done && \
+    for attempt in 1 2 3 4 5; do \
+      apt-get -o Acquire::Retries=10 install -y --fix-missing --no-install-recommends \
+        novnc openbox websockify x11-utils x11vnc xvfb && break; \
       test "$attempt" = 5 && exit 1; sleep 2; \
     done
 
