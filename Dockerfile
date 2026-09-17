@@ -28,12 +28,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 WORKDIR /app
 
-# 1. 先安装必要工具，然后配置阿里云镜像源
-RUN apt-get update && apt-get install -y ca-certificates wget gnupg && \
-    sed -i 's|http://archive.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list && \
-    sed -i 's|http://security.ubuntu.com|https://mirrors.aliyun.com|g' /etc/apt/sources.list
-
-# 2. 安装内置浏览器运行依赖（Chromium 库）和中文字体
+# 1. 安装内置浏览器运行依赖（Chromium 库）和中文字体
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -85,11 +80,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. 创建目录并设置权限。
+# 2. 创建目录并设置权限。
 RUN mkdir -p /app/data/home /app/data/config /app/images && \
     chmod -R 777 /app/data /app/images
 
-# 4. 下载并解压内置浏览器。构建阶段预置，运行时零下载。
+# 3. 下载并解压内置浏览器。构建阶段预置，运行时零下载。
 # 版本号唯一来源：browser/browser_version.txt（Go 也读它，避免两处漂移）。
 # 从自建 CDN 下载中性文件名，并校验 SHA256。
 #
