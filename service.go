@@ -187,7 +187,9 @@ func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatus
 
 // GetLoginQrcode 获取登录的扫码二维码
 func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeResponse, error) {
-	b := newBrowser()
+	// 登录接管必须显示在 Provider 自己的 Xvfb/noVNC 桌面；其他只读检查仍保持
+	// headless，避免短生命周期的状态检查窗口遮住正在等待扫码的页面。
+	b := newLoginBrowser()
 	page := b.NewPage()
 
 	deferFunc := func() {
@@ -807,6 +809,13 @@ func (s *XiaohongshuService) ReplyNotification(ctx context.Context, commentID, c
 
 func newBrowser() *headless_browser.Browser {
 	return browser.NewBrowser(configs.IsHeadless(),
+		browser.WithFingerprintSeed(configs.FingerprintSeed()),
+		browser.WithProxy(configs.Proxy()),
+	)
+}
+
+func newLoginBrowser() *headless_browser.Browser {
+	return browser.NewBrowser(false,
 		browser.WithFingerprintSeed(configs.FingerprintSeed()),
 		browser.WithProxy(configs.Proxy()),
 	)
