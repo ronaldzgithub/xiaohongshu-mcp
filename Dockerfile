@@ -81,8 +81,14 @@ RUN --mount=type=cache,id=xhs-apt-lists,target=/var/lib/apt/lists,sharing=locked
     libxss1 \
     libxtst6 \
     lsb-release \
+    novnc \
+    openbox \
     tini \
+    websockify \
     wget \
+    x11-utils \
+    x11vnc \
+    xvfb \
       xdg-utils \
       xz-utils && break; \
       test "$attempt" = 5 && exit 1; sleep 2; \
@@ -120,14 +126,17 @@ RUN --mount=type=cache,id=xhs-browser-download,target=/browser-download,sharing=
     chmod -R 755 /app/cache
 
 COPY --from=builder /out/app .
+COPY docker-entrypoint-novnc.sh /usr/local/bin/xhs-novnc-entrypoint
+RUN chmod 0755 /usr/local/bin/xhs-novnc-entrypoint
 
 ENV HOME=/app/data/home
 ENV XDG_CONFIG_HOME=/app/data/config
+ENV DISPLAY=:99
 
-EXPOSE 18060
+EXPOSE 18060 6080
 
-# 用 tini 回收浏览器退出后被过继过来的子进程，避免堆积僵尸进程。
-# -s 注册为 child subreaper，容器另外带了 init 进程（如 compose 的 init: true）时同样生效
-ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
+# 同一容器内提供 Xvfb + noVNC。登录二维码对应的正是 Provider 自己的浏览器，
+# 因而扫码后仍由本进程保存 cookies，不会产生平行登录态。
+ENTRYPOINT ["/usr/local/bin/xhs-novnc-entrypoint"]
 
 CMD ["./app"]
