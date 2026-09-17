@@ -101,14 +101,21 @@ RUN mkdir -p /app/data/home /app/data/config /app/images && \
 # 注意 XDG_CACHE_HOME 指向 /app/cache 而非挂载卷内，否则预置的浏览器会被挂载盖掉。
 ENV XDG_CACHE_HOME=/app/cache
 COPY browser/browser_version.txt /tmp/browser_version.txt
-RUN VER="$(cat /tmp/browser_version.txt | tr -d '[:space:]')" && \
+RUN --mount=type=cache,id=xhs-browser-download,target=/browser-download,sharing=locked \
+    VER="$(cat /tmp/browser_version.txt | tr -d '[:space:]')" && \
     BASE="https://cdn.one-world.ai/browsers/${VER}" && \
     BROWSER_DIR="${XDG_CACHE_HOME}/xiaohongshu-mcp/browser/${VER}" && \
+    ARCHIVE="/browser-download/${VER}-linux-x64.tar.xz" && \
+    SUMS="/browser-download/${VER}-SHA256SUMS" && \
     mkdir -p "${BROWSER_DIR}" && \
-    curl -fsSL -o /tmp/browser.tar.xz "${BASE}/linux-x64.tar.xz" && \
-    curl -fsSL "${BASE}/SHA256SUMS" | grep " linux-x64.tar.xz$" | awk '{print $1"  /tmp/browser.tar.xz"}' | sha256sum -c - && \
-    tar -xJf /tmp/browser.tar.xz -C "${BROWSER_DIR}" --strip-components=1 && \
-    rm /tmp/browser.tar.xz /tmp/browser_version.txt && \
+    curl -fSL --retry 10 --retry-all-errors --retry-delay 2 \
+      --continue-at - -o "${ARCHIVE}" "${BASE}/linux-x64.tar.xz" && \
+    curl -fSL --retry 10 --retry-all-errors --retry-delay 2 \
+      -o "${SUMS}" "${BASE}/SHA256SUMS" && \
+    grep " linux-x64.tar.xz$" "${SUMS}" | \
+      awk -v archive="${ARCHIVE}" '{print $1"  "archive}' | sha256sum -c - && \
+    tar -xJf "${ARCHIVE}" -C "${BROWSER_DIR}" --strip-components=1 && \
+    rm /tmp/browser_version.txt && \
     test -x "${BROWSER_DIR}/chrome" && \
     chmod -R 755 /app/cache
 
