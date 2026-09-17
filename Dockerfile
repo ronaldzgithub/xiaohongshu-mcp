@@ -9,6 +9,9 @@ ENV GOPROXY=https://goproxy.cn,direct
 ENV GOSUMDB=sum.golang.google.cn
 
 COPY go.mod go.sum ./
+# go.mod replaces headless_browser with this vendored module, so it must be
+# present before dependency resolution runs.
+COPY third_party/headless_browser ./third_party/headless_browser
 RUN go mod download
 
 COPY . .
