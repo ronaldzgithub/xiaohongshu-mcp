@@ -29,7 +29,10 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 WORKDIR /app
 
 # 1. 安装内置浏览器运行依赖（Chromium 库）和中文字体
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,id=xhs-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,id=xhs-apt-archives,target=/var/cache/apt,sharing=locked \
+    apt-get -o Acquire::Retries=10 update && \
+    apt-get -o Acquire::Retries=10 install -y --fix-missing --no-install-recommends \
     ca-certificates \
     curl \
     fonts-liberation \
@@ -77,8 +80,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     wget \
     xdg-utils \
-    xz-utils \
-    && rm -rf /var/lib/apt/lists/*
+    xz-utils
 
 # 2. 创建目录并设置权限。
 RUN mkdir -p /app/data/home /app/data/config /app/images && \
