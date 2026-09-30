@@ -2,15 +2,91 @@ package xiaohongshu
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/sirupsen/logrus"
 	logrustest "github.com/sirupsen/logrus/hooks/test"
 )
+
+func TestSearchNetworkDiagnosticsAreScopedBoundedAndRedacted(t *testing.T) {
+	diagnostics := &searchNetworkDiagnostics{}
+	request := func(id, address string, kind proto.NetworkResourceType) {
+		diagnostics.request(&proto.NetworkRequestWillBeSent{RequestID: proto.NetworkRequestID(id), Type: kind,
+			Request: &proto.NetworkRequest{URL: address}})
+	}
+	request("unrelated", "https://example.com/search?private", proto.NetworkResourceTypeXHR)
+	request("wrong-host", "https://xiaohongshu.com.example.com/search?private", proto.NetworkResourceTypeXHR)
+	request("wrong-kind", "https://www.xiaohongshu.com/search", proto.NetworkResourceTypeDocument)
+	request("wrong-path", "https://www.xiaohongshu.com/api/feed", proto.NetworkResourceTypeFetch)
+	count, requests := diagnostics.snapshot()
+	if count != 0 || len(requests) != 0 {
+		t.Fatal("unrelated traffic must not be retained")
+	}
+	request("private-request-id", "https://user:private-password@edith.xiaohongshu.com/api/sns/web/v1/search/notes?keyword=private-keyword#private-fragment", proto.NetworkResourceTypeXHR)
+	diagnostics.response(&proto.NetworkResponseReceived{RequestID: "private-request-id", Response: &proto.NetworkResponse{Status: 200}})
+	diagnostics.finished(&proto.NetworkLoadingFinished{RequestID: "private-request-id"})
+	request("failed", "https://edith.xiaohongshu.com/api/search?xsec_token=private-token", proto.NetworkResourceTypeFetch)
+	diagnostics.failed(&proto.NetworkLoadingFailed{RequestID: "failed", Canceled: true, BlockedReason: "csp", ErrorText: "private-error-text"})
+	request("unknown-reason", "https://edith.xiaohongshu.com/api/search", proto.NetworkResourceTypeFetch)
+	diagnostics.failed(&proto.NetworkLoadingFailed{RequestID: "unknown-reason", BlockedReason: "private-reason"})
+	for index := 0; index < 10; index++ {
+		request(fmt.Sprintf("extra%d", index), "https://edith.xiaohongshu.com/api/search", proto.NetworkResourceTypeFetch)
+	}
+	count, requests = diagnostics.snapshot()
+	if count != 13 || len(requests) != 8 || requests[0].HTTPStatus != 200 || !requests[0].Completed ||
+		!requests[1].Failed || !requests[1].Canceled || requests[1].BlockedReason != "csp" || requests[2].BlockedReason != "other" {
+		t.Fatalf("incorrect bounded request summary: count=%d requests=%+v", count, requests)
+	}
+	if requests[0].Origin != "https://edith.xiaohongshu.com" || requests[0].Path != "/api/sns/web/v1/search/notes" {
+		t.Fatal("request address must contain only origin and path")
+	}
+	encoded, err := json.Marshal(requests)
+	if err != nil || strings.Contains(string(encoded), "private") || strings.Contains(string(encoded), "?") {
+		t.Fatal("network diagnostics leaked request metadata")
+	}
+	requests[0].HTTPStatus = 500
+	_, again := diagnostics.snapshot()
+	if again[0].HTTPStatus != 200 {
+		t.Fatal("snapshot must not share mutable request storage")
+	}
+}
+
+func TestSearchNetworkListenerEndsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	stop := runSearchNetworkListener(cancel, func() { <-ctx.Done(); close(finished) })
+	stopped := make(chan struct{})
+	go func() { stop(); stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("listener stop blocked after cancellation")
+	}
+	select {
+	case <-finished:
+	default:
+		t.Fatal("stop returned before listener exited")
+	}
+}
+
+func TestSearchNetworkDiagnosticsJoinSingleTimeoutLog(t *testing.T) {
+	oldHooks := logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks))
+	defer logrus.StandardLogger().ReplaceHooks(oldHooks)
+	hook := logrustest.NewGlobal()
+	diagnostics := &searchNetworkDiagnostics{}
+	searchNotReadyError(context.DeadlineExceeded, searchFeedState{Network: diagnostics})
+	entries := hook.AllEntries()
+	if len(entries) != 1 || entries[0].Data["search_request_count"] != 0 ||
+		entries[0].Data["search_requests"] != "[]" {
+		t.Fatal("no observed search request must be explicit in the single timeout log")
+	}
+}
 
 func TestSearchReadinessWaitsForFeedsWithoutPageStability(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

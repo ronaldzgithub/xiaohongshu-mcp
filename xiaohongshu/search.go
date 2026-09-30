@@ -8,9 +8,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/sirupsen/logrus"
 	"github.com/xpzouying/xiaohongshu-mcp/humanize"
 )
@@ -102,11 +104,18 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 	page := s.page.Context(ctx)
+	network, stopObserving := observeSearchNetwork(page)
+	defer stopObserving()
+	observe := func() (searchFeedState, error) {
+		state, err := readSearchFeeds(page)
+		state.Network = network
+		return state, err
+	}
 
 	searchURL := makeSearchURL(keyword)
 	feeds, err := waitSearchFeeds(ctx,
 		func() error { return page.Navigate(searchURL) },
-		func() (searchFeedState, error) { return readSearchFeeds(page) },
+		observe,
 	)
 	if err != nil {
 		return nil, err
@@ -152,7 +161,7 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 			return nil, err
 		}
 		feeds, err = waitSearchFeeds(ctx, func() error { return nil },
-			func() (searchFeedState, error) { return readSearchFeeds(page) })
+			observe)
 		if err != nil {
 			return nil, err
 		}
@@ -162,17 +171,18 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 }
 
 type searchFeedState struct {
-	Ready           bool              `json:"ready"`
-	Feeds           []Feed            `json:"feeds"`
-	Origin          string            `json:"origin"`
-	Path            string            `json:"path"`
-	HasInitialState bool              `json:"hasInitialState"`
-	HasSearch       bool              `json:"hasSearch"`
-	HasFeeds        bool              `json:"hasFeeds"`
-	FeedType        string            `json:"feedType"`
-	FeedCount       int               `json:"feedCount"`
-	SearchFields    map[string]string `json:"searchFields"`
-	SearchBooleans  map[string]bool   `json:"searchBooleans"`
+	Ready           bool                      `json:"ready"`
+	Feeds           []Feed                    `json:"feeds"`
+	Origin          string                    `json:"origin"`
+	Path            string                    `json:"path"`
+	HasInitialState bool                      `json:"hasInitialState"`
+	HasSearch       bool                      `json:"hasSearch"`
+	HasFeeds        bool                      `json:"hasFeeds"`
+	FeedType        string                    `json:"feedType"`
+	FeedCount       int                       `json:"feedCount"`
+	SearchFields    map[string]string         `json:"searchFields"`
+	SearchBooleans  map[string]bool           `json:"searchBooleans"`
+	Network         *searchNetworkDiagnostics `json:"-"`
 }
 
 // 保留 errors.Is 的原因链，但 HTTP 错误中不展开浏览器异常或 DOM。
@@ -279,9 +289,132 @@ func searchNotReadyError(cause error, state searchFeedState) error {
 	fields["feeds_count"] = state.FeedCount
 	fields["search_fields"] = fieldTypes
 	fields["search_booleans"] = booleans
+	if state.Network != nil {
+		count, requests := state.Network.snapshot()
+		fields["search_request_count"] = count
+		encoded, _ := json.Marshal(requests) // Fixed scalar-only schema, including an explicit empty array.
+		fields["search_requests"] = string(encoded)
+	}
 	logrus.WithFields(fields).Warn("search_data_not_ready")
 	return fmt.Errorf("search feeds not ready (origin=%q path=%q initial_state=%t search=%t feeds=%t): %w",
 		state.Origin, state.Path, state.HasInitialState, state.HasSearch, state.HasFeeds, cause)
+}
+
+// Only this page's search XHR/Fetch metadata is retained. Request IDs are local
+// correlation keys and never logged; headers, bodies and error text are ignored.
+type searchNetworkRequest struct {
+	Origin        string `json:"origin"`
+	Path          string `json:"path"`
+	HTTPStatus    int    `json:"http_status"`
+	Completed     bool   `json:"completed"`
+	Failed        bool   `json:"failed"`
+	Canceled      bool   `json:"canceled"`
+	BlockedReason string `json:"blocked_reason,omitempty"`
+}
+
+type searchNetworkDiagnostics struct {
+	mu       sync.Mutex
+	count    int
+	order    []proto.NetworkRequestID
+	requests map[proto.NetworkRequestID]searchNetworkRequest
+}
+
+func (d *searchNetworkDiagnostics) request(event *proto.NetworkRequestWillBeSent) {
+	if event.Request == nil || (event.Type != proto.NetworkResourceTypeXHR && event.Type != proto.NetworkResourceTypeFetch) {
+		return
+	}
+	u, err := url.Parse(event.Request.URL)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return
+	}
+	host := strings.ToLower(u.Hostname())
+	if (host != "xiaohongshu.com" && !strings.HasSuffix(host, ".xiaohongshu.com")) ||
+		!strings.Contains(strings.ToLower(u.Path), "search") {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.count++
+	if d.requests == nil {
+		d.requests = make(map[proto.NetworkRequestID]searchNetworkRequest)
+	}
+	if _, exists := d.requests[event.RequestID]; exists || len(d.order) >= 8 {
+		return
+	}
+	d.order = append(d.order, event.RequestID)
+	d.requests[event.RequestID] = searchNetworkRequest{Origin: u.Scheme + "://" + u.Host, Path: u.EscapedPath()}
+}
+
+func (d *searchNetworkDiagnostics) response(event *proto.NetworkResponseReceived) {
+	if event.Response == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if value, exists := d.requests[event.RequestID]; exists {
+		value.HTTPStatus = event.Response.Status
+		d.requests[event.RequestID] = value
+	}
+}
+
+func (d *searchNetworkDiagnostics) finished(event *proto.NetworkLoadingFinished) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if value, exists := d.requests[event.RequestID]; exists {
+		value.Completed = true
+		d.requests[event.RequestID] = value
+	}
+}
+
+func (d *searchNetworkDiagnostics) failed(event *proto.NetworkLoadingFailed) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if value, exists := d.requests[event.RequestID]; exists {
+		value.Failed, value.Canceled = true, event.Canceled
+		reason := string(event.BlockedReason)
+		switch reason {
+		case "", "other", "csp", "mixed-content", "origin", "inspector", "subresource-filter", "content-type",
+			"coep-frame-resource-needs-coep-header", "coop-sandboxed-iframe-cannot-navigate-to-coop-page",
+			"corp-not-same-origin", "corp-not-same-site",
+			"corp-not-same-origin-after-defaulted-to-same-origin-by-coep",
+			"corp-not-same-origin-after-defaulted-to-same-origin-by-dip",
+			"corp-not-same-origin-after-defaulted-to-same-origin-by-coep-and-dip":
+			value.BlockedReason = reason
+		default:
+			value.BlockedReason = "other"
+		}
+		d.requests[event.RequestID] = value
+	}
+}
+
+func (d *searchNetworkDiagnostics) snapshot() (int, []searchNetworkRequest) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	requests := make([]searchNetworkRequest, 0, len(d.order))
+	for _, id := range d.order {
+		requests = append(requests, d.requests[id])
+	}
+	return d.count, requests
+}
+
+func observeSearchNetwork(page *rod.Page) (*searchNetworkDiagnostics, func()) {
+	ctx, cancel := context.WithCancel(page.GetContext())
+	diagnostics := &searchNetworkDiagnostics{}
+	// EachEvent subscribes synchronously before navigation and filters SessionID.
+	wait := page.Context(ctx).EachEvent(diagnostics.request, diagnostics.response, diagnostics.finished, diagnostics.failed)
+	return diagnostics, runSearchNetworkListener(cancel, wait)
+}
+
+func runSearchNetworkListener(cancel context.CancelFunc, wait func()) func() {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		wait()
+	}()
+	return func() {
+		cancel()
+		<-done // Rod's event stream and domain restoration share the cancelled context.
+	}
 }
 
 var searchStateFieldName = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]{0,47}$`)
