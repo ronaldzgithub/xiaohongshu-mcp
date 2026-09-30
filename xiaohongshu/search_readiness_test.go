@@ -83,8 +83,63 @@ func TestSearchNetworkDiagnosticsJoinSingleTimeoutLog(t *testing.T) {
 	searchNotReadyError(context.DeadlineExceeded, searchFeedState{Network: diagnostics})
 	entries := hook.AllEntries()
 	if len(entries) != 1 || entries[0].Data["search_request_count"] != 0 ||
-		entries[0].Data["search_requests"] != "[]" {
+		entries[0].Data["search_requests"] != "[]" || entries[0].Data["page_request_count"] != 0 ||
+		entries[0].Data["network_enable_status"] != "not_checked" || entries[0].Data["search_startup_script_failures"] != "[]" {
 		t.Fatal("no observed search request must be explicit in the single timeout log")
+	}
+}
+
+func TestSearchNetworkEnableStatusNeverExposesCDPError(t *testing.T) {
+	for _, item := range []struct {
+		err  error
+		want string
+	}{
+		{nil, "enabled"}, {fmt.Errorf("private: %w", context.DeadlineExceeded), "deadline"},
+		{context.Canceled, "cancelled"}, {errors.New("private-token DOM browser error"), "enable_failed"},
+	} {
+		if got := searchNetworkEnableStatus(item.err); got != item.want {
+			t.Fatalf("status=%s want=%s", got, item.want)
+		}
+	}
+}
+
+func TestSearchStartupScriptFailuresAreBoundedAndOnlyKnownPublicPaths(t *testing.T) {
+	diagnostics := &searchNetworkDiagnostics{enableStatus: "enabled"}
+	prefix := "https://fe-static.xhscdn.com/formula-static/xhs-pc-web/public/resource/js/"
+	for index, address := range []string{
+		prefix + "async/Search.6e28756e.js?private-token#private-fragment",
+		prefix + "index.0280008a.js", prefix + "vendor.f7bfc54c.js",
+		prefix + "async/private-token/Search.6e28756e.js",
+		prefix + "async/private-token.12345678.js",
+		"https://example.com/formula-static/xhs-pc-web/public/resource/js/async/Search.6e28756e.js",
+	} {
+		id := proto.NetworkRequestID(fmt.Sprintf("script-%d", index))
+		diagnostics.request(&proto.NetworkRequestWillBeSent{RequestID: id, Type: proto.NetworkResourceTypeScript, Request: &proto.NetworkRequest{URL: address}})
+		status := 403
+		if index == 2 {
+			status = 200
+		}
+		diagnostics.response(&proto.NetworkResponseReceived{RequestID: id, Response: &proto.NetworkResponse{Status: status}})
+		if index == 1 {
+			diagnostics.failed(&proto.NetworkLoadingFailed{RequestID: id, Canceled: true, ErrorText: "private-error"})
+		}
+	}
+	status, total, failures := diagnostics.startupSnapshot()
+	if status != "enabled" || total != 6 || len(failures) != 2 || failures[0].HTTPStatus != 403 || !failures[1].Canceled {
+		t.Fatalf("unexpected startup summary: %s %d %+v", status, total, failures)
+	}
+	encoded, _ := json.Marshal(failures)
+	if strings.Contains(string(encoded), "private") || strings.Contains(string(encoded), "?") {
+		t.Fatal("unsafe script failure summary")
+	}
+	for index := 0; index < 50; index++ {
+		id := proto.NetworkRequestID(fmt.Sprintf("repeated-script-%d", index))
+		diagnostics.request(&proto.NetworkRequestWillBeSent{RequestID: id, Type: proto.NetworkResourceTypeScript, Request: &proto.NetworkRequest{URL: prefix + "async/Search.6e28756e.js"}})
+		diagnostics.failed(&proto.NetworkLoadingFailed{RequestID: id})
+	}
+	_, total, failures = diagnostics.startupSnapshot()
+	if total != 56 || len(failures) != 8 || len(diagnostics.scripts) > 32 {
+		t.Fatal("startup diagnostics must remain bounded")
 	}
 }
 

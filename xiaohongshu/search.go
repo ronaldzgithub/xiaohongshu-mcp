@@ -3,6 +3,7 @@ package xiaohongshu
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -294,6 +295,11 @@ func searchNotReadyError(cause error, state searchFeedState) error {
 		fields["search_request_count"] = count
 		encoded, _ := json.Marshal(requests) // Fixed scalar-only schema, including an explicit empty array.
 		fields["search_requests"] = string(encoded)
+		enabled, total, scriptFailures := state.Network.startupSnapshot()
+		fields["network_enable_status"] = enabled
+		fields["page_request_count"] = total
+		encoded, _ = json.Marshal(scriptFailures)
+		fields["search_startup_script_failures"] = string(encoded)
 	}
 	logrus.WithFields(fields).Warn("search_data_not_ready")
 	return fmt.Errorf("search feeds not ready (origin=%q path=%q initial_state=%t search=%t feeds=%t): %w",
@@ -313,13 +319,31 @@ type searchNetworkRequest struct {
 }
 
 type searchNetworkDiagnostics struct {
-	mu       sync.Mutex
-	count    int
-	order    []proto.NetworkRequestID
-	requests map[proto.NetworkRequestID]searchNetworkRequest
+	mu           sync.Mutex
+	count        int
+	order        []proto.NetworkRequestID
+	requests     map[proto.NetworkRequestID]searchNetworkRequest
+	enableStatus string
+	total        int
+	scriptOrder  []proto.NetworkRequestID
+	scripts      map[proto.NetworkRequestID]searchNetworkRequest
 }
 
 func (d *searchNetworkDiagnostics) request(event *proto.NetworkRequestWillBeSent) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.total++
+	if event.Request != nil && event.Type == proto.NetworkResourceTypeScript {
+		if address, ok := searchStartupScript(event.Request.URL); ok && len(d.scriptOrder) < 32 {
+			if d.scripts == nil {
+				d.scripts = make(map[proto.NetworkRequestID]searchNetworkRequest)
+			}
+			if _, exists := d.scripts[event.RequestID]; !exists {
+				d.scriptOrder = append(d.scriptOrder, event.RequestID)
+				d.scripts[event.RequestID] = address
+			}
+		}
+	}
 	if event.Request == nil || (event.Type != proto.NetworkResourceTypeXHR && event.Type != proto.NetworkResourceTypeFetch) {
 		return
 	}
@@ -332,8 +356,6 @@ func (d *searchNetworkDiagnostics) request(event *proto.NetworkRequestWillBeSent
 		!strings.Contains(strings.ToLower(u.Path), "search") {
 		return
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.count++
 	if d.requests == nil {
 		d.requests = make(map[proto.NetworkRequestID]searchNetworkRequest)
@@ -355,6 +377,10 @@ func (d *searchNetworkDiagnostics) response(event *proto.NetworkResponseReceived
 		value.HTTPStatus = event.Response.Status
 		d.requests[event.RequestID] = value
 	}
+	if value, exists := d.scripts[event.RequestID]; exists {
+		value.HTTPStatus = event.Response.Status
+		d.scripts[event.RequestID] = value
+	}
 }
 
 func (d *searchNetworkDiagnostics) finished(event *proto.NetworkLoadingFinished) {
@@ -364,11 +390,19 @@ func (d *searchNetworkDiagnostics) finished(event *proto.NetworkLoadingFinished)
 		value.Completed = true
 		d.requests[event.RequestID] = value
 	}
+	if value, exists := d.scripts[event.RequestID]; exists {
+		value.Completed = true
+		d.scripts[event.RequestID] = value
+	}
 }
 
 func (d *searchNetworkDiagnostics) failed(event *proto.NetworkLoadingFailed) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if value, exists := d.scripts[event.RequestID]; exists {
+		value.Failed, value.Canceled = true, event.Canceled
+		d.scripts[event.RequestID] = value
+	}
 	if value, exists := d.requests[event.RequestID]; exists {
 		value.Failed, value.Canceled = true, event.Canceled
 		reason := string(event.BlockedReason)
@@ -402,7 +436,55 @@ func observeSearchNetwork(page *rod.Page) (*searchNetworkDiagnostics, func()) {
 	diagnostics := &searchNetworkDiagnostics{}
 	// EachEvent subscribes synchronously before navigation and filters SessionID.
 	wait := page.Context(ctx).EachEvent(diagnostics.request, diagnostics.response, diagnostics.finished, diagnostics.failed)
+	// EachEvent's automatic enable ignores errors; explicitly confirm the CDP ACK.
+	diagnostics.enableStatus = searchNetworkEnableStatus((proto.NetworkEnable{}).Call(page.Context(ctx)))
 	return diagnostics, runSearchNetworkListener(cancel, wait)
+}
+
+func searchNetworkEnableStatus(err error) string {
+	switch {
+	case err == nil:
+		return "enabled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, context.Canceled):
+		return "cancelled"
+	default:
+		return "enable_failed"
+	}
+}
+
+// Public Search route startup dependencies observed in index.0280008a.js and
+// bundler-runtime.e5dd7116.js. Accept changing build hashes, never arbitrary paths.
+var searchStartupScriptPath = regexp.MustCompile(`^/formula-static/xhs-pc-web/public/resource/js/(?:bundler-runtime|vendor-dynamic|library-polyfill|library-lodash|vendor|index|async/(?:Search|WorldCupShared|157|8233|9220|799|8390|7279|2492))\.[a-f0-9]{8}\.js$`)
+
+func searchStartupScript(address string) (searchNetworkRequest, bool) {
+	u, err := url.Parse(address)
+	if err != nil || u.Scheme != "https" || u.Host != "fe-static.xhscdn.com" ||
+		!searchStartupScriptPath.MatchString(u.EscapedPath()) {
+		return searchNetworkRequest{}, false
+	}
+	return searchNetworkRequest{Origin: "https://fe-static.xhscdn.com", Path: u.EscapedPath()}, true
+}
+
+func (d *searchNetworkDiagnostics) startupSnapshot() (string, int, []searchNetworkRequest) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	failures := make([]searchNetworkRequest, 0)
+	for _, id := range d.scriptOrder {
+		value := d.scripts[id]
+		if value.Failed || value.HTTPStatus >= 400 {
+			failures = append(failures, value)
+			if len(failures) == 8 {
+				break
+			}
+		}
+	}
+	status := d.enableStatus
+	if status == "" {
+		status = "not_checked"
+	}
+	return status, d.total, failures
 }
 
 func runSearchNetworkListener(cancel context.CancelFunc, wait func()) func() {
