@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 )
 
 func TestSearchReadinessWaitsForFeedsWithoutPageStability(t *testing.T) {
@@ -45,18 +48,34 @@ func TestSearchReadinessInitialEmptyArrayIsNotCompletedSearch(t *testing.T) {
 }
 
 func TestSearchReadinessDeadlineHasOnlySafePageDiagnostics(t *testing.T) {
+	oldHooks := logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks))
+	defer logrus.StandardLogger().ReplaceHooks(oldHooks)
+	hook := logrustest.NewGlobal()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	_, err := waitSearchFeeds(ctx, func() error { return nil }, func() (searchFeedState, error) {
 		return searchFeedState{Origin: "https://www.xiaohongshu.com", Path: "/search_result",
 			HasInitialState: true, HasSearch: true, HasFeeds: false,
-			Feeds: []Feed{{ID: "sensitive-test-id", XsecToken: "sensitive-test-token"}}}, nil
+			Feeds: []Feed{{ID: "sensitive-test-id DOM", XsecToken: "?xsec_token=sensitive-test-token"}}}, nil
 	})
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "initial_state=true search=true feeds=false") {
 		t.Fatalf("missing readiness deadline diagnostic: %v", err)
 	}
 	if strings.Contains(err.Error(), "sensitive-test") || strings.Contains(err.Error(), "?") {
 		t.Fatal("diagnostic includes result data or query")
+	}
+	entries := hook.AllEntries()
+	if len(entries) != 1 || entries[0].Message != "search_data_not_ready" || len(entries[0].Data) != 5 {
+		t.Fatalf("expected one bounded readiness log, got %d entries", len(entries))
+	}
+	fields := entries[0].Data
+	if fields["origin"] != "https://www.xiaohongshu.com" || fields["path"] != "/search_result" ||
+		fields["initial_state"] != true || fields["search"] != true || fields["feeds"] != false {
+		t.Fatal("readiness log lacks exact safe diagnostics")
+	}
+	serialized, serializeErr := entries[0].String()
+	if serializeErr != nil || strings.Contains(serialized, "sensitive-test") || strings.Contains(serialized, "?") {
+		t.Fatal("readiness log includes result data or query")
 	}
 }
 

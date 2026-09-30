@@ -247,6 +247,10 @@ func waitSearchFeeds(ctx context.Context, navigate func() error, observe func() 
 
 func searchNotReadyError(cause error, state searchFeedState) error {
 	// 不记录 URL query、页面内容、账号或搜索结果。
+	logrus.WithFields(logrus.Fields{
+		"origin": state.Origin, "path": state.Path,
+		"initial_state": state.HasInitialState, "search": state.HasSearch, "feeds": state.HasFeeds,
+	}).Warn("search_data_not_ready")
 	return fmt.Errorf("search feeds not ready (origin=%q path=%q initial_state=%t search=%t feeds=%t): %w",
 		state.Origin, state.Path, state.HasInitialState, state.HasSearch, state.HasFeeds, cause)
 }
