@@ -11,7 +11,6 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/sirupsen/logrus"
-	"github.com/xpzouying/xiaohongshu-mcp/errors"
 	"github.com/xpzouying/xiaohongshu-mcp/humanize"
 )
 
@@ -88,9 +87,7 @@ type SearchAction struct {
 }
 
 func NewSearchAction(page *rod.Page) *SearchAction {
-	pp := page.Timeout(60 * time.Second)
-
-	return &SearchAction{page: pp}
+	return &SearchAction{page: page}
 }
 
 func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...FilterOption) ([]Feed, error) {
@@ -100,26 +97,39 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 		return nil, err
 	}
 
-	// 注意 .Context(ctx) 会替换掉 NewSearchAction 里设的 60s deadline，必须在其后重新 Timeout，
-	// 否则搜索页不 stable 时 MustWaitStable/MustWait 会永久挂起（无 deadline 可依赖）。
-	page := s.page.Context(ctx).Timeout(60 * time.Second)
+	// 搜索必须在调用方的 30s HTTP 超时前返回；导航与数据读取共用期限。
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	page := s.page.Context(ctx)
 
 	searchURL := makeSearchURL(keyword)
-	page.MustNavigate(searchURL)
-	page.MustWaitStable()
-	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
+	feeds, err := waitSearchFeeds(ctx,
+		func() error { return page.Navigate(searchURL) },
+		func() (searchFeedState, error) { return readSearchFeeds(page) },
+	)
+	if err != nil {
+		return nil, err
+	}
 	humanize.Delay(ctx, humanize.AfterNavigate)
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("search result deadline: %w", err)
+	}
 
 	if len(pending) > 0 {
 		// 悬停在筛选按钮上展开面板
-		filterButton := page.MustElement(`div.filter`)
+		filterButton, err := page.Element(`div.filter`)
+		if err != nil {
+			return nil, &searchStageError{"等待筛选按钮失败", err}
+		}
 		if err := humanize.Hover(filterButton); err != nil {
-			return nil, fmt.Errorf("悬停筛选按钮失败: %w", err)
+			return nil, &searchStageError{"悬停筛选按钮失败", err}
 		}
 		humanize.Delay(ctx, humanize.BeforeClick)
 
 		// 等待筛选面板出现
-		page.MustWait(`() => document.querySelector('div.filter-panel') !== null`)
+		if err := page.Wait(rod.Eval(`() => document.querySelector('div.filter-panel') !== null`)); err != nil {
+			return nil, &searchStageError{"等待筛选面板失败", err}
+		}
 
 		// 记下筛选前的结果，用来判断筛选后的数据什么时候到位
 		before := readFeedIDs(page)
@@ -129,40 +139,116 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 		for _, pf := range pending {
 			option, err := findFilterOption(page, pf)
 			if err != nil {
-				return nil, err
+				return nil, &searchStageError{"查找筛选选项失败", err}
 			}
 			humanize.Delay(ctx, humanize.BeforeClick)
 			if err := humanize.ClickNoWait(option); err != nil {
-				return nil, fmt.Errorf("点击筛选选项「%s」失败: %w", pf.option, err)
+				return nil, &searchStageError{"点击筛选选项失败", err}
 			}
 		}
 
-		waitFeedsChanged(page, before, 15*time.Second)
-	}
-
-	result := page.MustEval(`() => {
-		if (window.__INITIAL_STATE__ &&
-		    window.__INITIAL_STATE__.search &&
-		    window.__INITIAL_STATE__.search.feeds) {
-			const feeds = window.__INITIAL_STATE__.search.feeds;
-			const feedsData = feeds.value !== undefined ? feeds.value : feeds._value;
-			if (feedsData) {
-				return JSON.stringify(feedsData);
-			}
+		if err := waitFeedsChanged(ctx, before, 15*time.Second, func() string { return readFeedIDs(page) }); err != nil {
+			return nil, err
 		}
-		return "";
-	}`).String()
-
-	if result == "" {
-		return nil, errors.ErrNoFeeds
-	}
-
-	var feeds []Feed
-	if err := json.Unmarshal([]byte(result), &feeds); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal feeds: %w", err)
+		feeds, err = waitSearchFeeds(ctx, func() error { return nil },
+			func() (searchFeedState, error) { return readSearchFeeds(page) })
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return onlyNotes(feeds), nil
+}
+
+type searchFeedState struct {
+	Ready           bool   `json:"ready"`
+	Feeds           []Feed `json:"feeds"`
+	Origin          string `json:"origin"`
+	Path            string `json:"path"`
+	HasInitialState bool   `json:"hasInitialState"`
+	HasSearch       bool   `json:"hasSearch"`
+	HasFeeds        bool   `json:"hasFeeds"`
+}
+
+// 保留 errors.Is 的原因链，但 HTTP 错误中不展开浏览器异常或 DOM。
+type searchStageError struct {
+	stage string
+	cause error
+}
+
+func (e *searchStageError) Error() string { return e.stage }
+func (e *searchStageError) Unwrap() error { return e.cause }
+
+// 只等待所需的搜索数据；图片、埋点和页面动画不影响可读结果。
+const searchFeedStateJS = `() => {
+	const feeds = window.__INITIAL_STATE__?.search?.feeds;
+	const data = Array.isArray(feeds) ? feeds
+		: feeds && (feeds.value !== undefined ? feeds.value : feeds._value);
+	// 空数组可能只是初始化，不能证明搜索已完成。
+	return JSON.stringify({ready:Array.isArray(data) && data.length > 0, feeds:Array.isArray(data) ? data : null,
+		origin:window.location.origin, path:window.location.pathname,
+		hasInitialState:window.__INITIAL_STATE__ !== undefined,
+		hasSearch:window.__INITIAL_STATE__?.search !== undefined,
+		hasFeeds:feeds !== undefined});
+}`
+
+func readSearchFeeds(page *rod.Page) (searchFeedState, error) {
+	result, err := page.Eval(searchFeedStateJS)
+	if err != nil {
+		return searchFeedState{}, &searchStageError{"read search feeds failed", err}
+	}
+	var state searchFeedState
+	if err := json.Unmarshal([]byte(result.Value.String()), &state); err != nil {
+		return searchFeedState{}, &searchStageError{"decode search feeds failed", err}
+	}
+	return state, nil
+}
+
+func waitSearchFeeds(ctx context.Context, navigate func() error, observe func() (searchFeedState, error)) ([]Feed, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("search cancelled: %w", err)
+	}
+	if err := navigate(); err != nil {
+		return nil, &searchStageError{"navigate search failed", err}
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	var last searchFeedState
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, searchNotReadyError(err, last)
+		}
+		state, err := observe()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, searchNotReadyError(ctx.Err(), last)
+			}
+			return nil, &searchStageError{"read search feeds failed", err}
+		}
+		last = state
+		if err := ctx.Err(); err != nil {
+			return nil, searchNotReadyError(err, last)
+		}
+		if state.Ready {
+			if state.Feeds == nil {
+				return nil, fmt.Errorf("search feeds are not an array")
+			}
+			if len(state.Feeds) > 0 {
+				return state.Feeds, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, searchNotReadyError(ctx.Err(), last)
+		case <-ticker.C:
+		}
+	}
+}
+
+func searchNotReadyError(cause error, state searchFeedState) error {
+	// 不记录 URL query、页面内容、账号或搜索结果。
+	return fmt.Errorf("search feeds not ready (origin=%q path=%q initial_state=%t search=%t feeds=%t): %w",
+		state.Origin, state.Path, state.HasInitialState, state.HasSearch, state.HasFeeds, cause)
 }
 
 // feedIDsJS 读当前结果集的 id 列表，用来判断数据有没有换一批。
@@ -188,15 +274,31 @@ func readFeedIDs(page *rod.Page) string {
 // 立即返回，等于没等——多个筛选项一起用时表现为只有一部分生效。
 //
 // 超时不报错：筛选已经点上了，宁可返回可能偏旧的数据，也不要整个搜索失败。
-func waitFeedsChanged(page *rod.Page, before string, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if now := readFeedIDs(page); now != "" && now != before {
-			return
+func waitFeedsChanged(ctx context.Context, before string, timeout time.Duration, read func() string) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("等待筛选结果取消: %w", err)
 		}
-		time.Sleep(300 * time.Millisecond)
+		now := read()
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("等待筛选结果取消: %w", err)
+		}
+		if now != "" && now != before {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("等待筛选结果取消: %w", ctx.Err())
+		case <-deadline.C:
+			logrus.Warnf("筛选后等待结果刷新超时（%s），返回的可能是筛选前的数据", timeout)
+			return nil
+		case <-ticker.C:
+		}
 	}
-	logrus.Warnf("筛选后等待结果刷新超时（%s），返回的可能是筛选前的数据", timeout)
 }
 
 // findFilterOption 在筛选面板里定位一个选项：按标签找到组，再在组内按文本找选项。
