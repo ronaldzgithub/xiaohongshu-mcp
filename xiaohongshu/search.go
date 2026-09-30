@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -161,13 +162,17 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 }
 
 type searchFeedState struct {
-	Ready           bool   `json:"ready"`
-	Feeds           []Feed `json:"feeds"`
-	Origin          string `json:"origin"`
-	Path            string `json:"path"`
-	HasInitialState bool   `json:"hasInitialState"`
-	HasSearch       bool   `json:"hasSearch"`
-	HasFeeds        bool   `json:"hasFeeds"`
+	Ready           bool              `json:"ready"`
+	Feeds           []Feed            `json:"feeds"`
+	Origin          string            `json:"origin"`
+	Path            string            `json:"path"`
+	HasInitialState bool              `json:"hasInitialState"`
+	HasSearch       bool              `json:"hasSearch"`
+	HasFeeds        bool              `json:"hasFeeds"`
+	FeedType        string            `json:"feedType"`
+	FeedCount       int               `json:"feedCount"`
+	SearchFields    map[string]string `json:"searchFields"`
+	SearchBooleans  map[string]bool   `json:"searchBooleans"`
 }
 
 // 保留 errors.Is 的原因链，但 HTTP 错误中不展开浏览器异常或 DOM。
@@ -181,15 +186,33 @@ func (e *searchStageError) Unwrap() error { return e.cause }
 
 // 只等待所需的搜索数据；图片、埋点和页面动画不影响可读结果。
 const searchFeedStateJS = `() => {
-	const feeds = window.__INITIAL_STATE__?.search?.feeds;
+	const search = window.__INITIAL_STATE__?.search;
+	const feeds = search?.feeds;
 	const data = Array.isArray(feeds) ? feeds
 		: feeds && (feeds.value !== undefined ? feeds.value : feeds._value);
+	const type = value => value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+	// 只观察实际字段名、类型及布尔值，不假定某个字段代表加载完成。
+	const searchFields = {}, searchBooleans = {};
+	if (search && typeof search === 'object') {
+		for (const key of Object.keys(search).filter(key => /^[A-Za-z_$][A-Za-z0-9_$]{0,47}$/.test(key)).sort().slice(0, 64)) {
+			try {
+				let value = search[key];
+				if (value && typeof value === 'object' && !Array.isArray(value)) {
+					if (value.value !== undefined) value = value.value;
+					else if (value._value !== undefined) value = value._value;
+				}
+				searchFields[key] = type(value);
+				if (typeof value === 'boolean') searchBooleans[key] = value;
+			} catch (_) { searchFields[key] = 'unreadable'; }
+		}
+	}
 	// 空数组可能只是初始化，不能证明搜索已完成。
 	return JSON.stringify({ready:Array.isArray(data) && data.length > 0, feeds:Array.isArray(data) ? data : null,
 		origin:window.location.origin, path:window.location.pathname,
 		hasInitialState:window.__INITIAL_STATE__ !== undefined,
-		hasSearch:window.__INITIAL_STATE__?.search !== undefined,
-		hasFeeds:feeds !== undefined});
+		hasSearch:search !== undefined, hasFeeds:feeds !== undefined,
+		feedType:type(data), feedCount:Array.isArray(data) ? data.length : -1,
+		searchFields, searchBooleans});
 }`
 
 func readSearchFeeds(page *rod.Page) (searchFeedState, error) {
@@ -247,12 +270,48 @@ func waitSearchFeeds(ctx context.Context, navigate func() error, observe func() 
 
 func searchNotReadyError(cause error, state searchFeedState) error {
 	// 不记录 URL query、页面内容、账号或搜索结果。
-	logrus.WithFields(logrus.Fields{
+	fields := logrus.Fields{
 		"origin": state.Origin, "path": state.Path,
 		"initial_state": state.HasInitialState, "search": state.HasSearch, "feeds": state.HasFeeds,
-	}).Warn("search_data_not_ready")
+	}
+	fieldTypes, booleans := safeSearchStateFields(state)
+	fields["feeds_type"] = safeSearchValueType(state.FeedType)
+	fields["feeds_count"] = state.FeedCount
+	fields["search_fields"] = fieldTypes
+	fields["search_booleans"] = booleans
+	logrus.WithFields(fields).Warn("search_data_not_ready")
 	return fmt.Errorf("search feeds not ready (origin=%q path=%q initial_state=%t search=%t feeds=%t): %w",
 		state.Origin, state.Path, state.HasInitialState, state.HasSearch, state.HasFeeds, cause)
+}
+
+var searchStateFieldName = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]{0,47}$`)
+
+func safeSearchValueType(value string) string {
+	if slices.Contains([]string{"undefined", "null", "array", "object", "boolean", "string", "number", "bigint", "symbol", "function", "unreadable"}, value) {
+		return value
+	}
+	return "unknown"
+}
+
+func safeSearchStateFields(state searchFeedState) (map[string]string, map[string]bool) {
+	keys := make([]string, 0, len(state.SearchFields))
+	for key := range state.SearchFields {
+		if searchStateFieldName.MatchString(key) {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	if len(keys) > 64 {
+		keys = keys[:64]
+	}
+	fields, booleans := make(map[string]string), make(map[string]bool)
+	for _, key := range keys {
+		fields[key] = safeSearchValueType(state.SearchFields[key])
+		if value, exists := state.SearchBooleans[key]; exists && fields[key] == "boolean" {
+			booleans[key] = value
+		}
+	}
+	return fields, booleans
 }
 
 // feedIDsJS 读当前结果集的 id 列表，用来判断数据有没有换一批。

@@ -3,6 +3,7 @@ package xiaohongshu
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -56,7 +57,10 @@ func TestSearchReadinessDeadlineHasOnlySafePageDiagnostics(t *testing.T) {
 	_, err := waitSearchFeeds(ctx, func() error { return nil }, func() (searchFeedState, error) {
 		return searchFeedState{Origin: "https://www.xiaohongshu.com", Path: "/search_result",
 			HasInitialState: true, HasSearch: true, HasFeeds: false,
-			Feeds: []Feed{{ID: "sensitive-test-id DOM", XsecToken: "?xsec_token=sensitive-test-token"}}}, nil
+			FeedType: "array", FeedCount: 0,
+			SearchFields:   map[string]string{"feeds": "array", "loading": "boolean", "error": "string", "query": "string", "?sensitive-test": "string"},
+			SearchBooleans: map[string]bool{"loading": true, "?sensitive-test": true},
+			Feeds:          []Feed{{ID: "sensitive-test-id DOM", XsecToken: "?xsec_token=sensitive-test-token"}}}, nil
 	})
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "initial_state=true search=true feeds=false") {
 		t.Fatalf("missing readiness deadline diagnostic: %v", err)
@@ -65,10 +69,15 @@ func TestSearchReadinessDeadlineHasOnlySafePageDiagnostics(t *testing.T) {
 		t.Fatal("diagnostic includes result data or query")
 	}
 	entries := hook.AllEntries()
-	if len(entries) != 1 || entries[0].Message != "search_data_not_ready" || len(entries[0].Data) != 5 {
+	if len(entries) != 1 || entries[0].Message != "search_data_not_ready" || len(entries[0].Data) != 9 {
 		t.Fatalf("expected one bounded readiness log, got %d entries", len(entries))
 	}
 	fields := entries[0].Data
+	if fields["feeds_type"] != "array" || fields["feeds_count"] != 0 ||
+		fields["search_fields"].(map[string]string)["error"] != "string" ||
+		fields["search_booleans"].(map[string]bool)["loading"] != true {
+		t.Fatal("readiness log lacks actual state types and boolean values")
+	}
 	if fields["origin"] != "https://www.xiaohongshu.com" || fields["path"] != "/search_result" ||
 		fields["initial_state"] != true || fields["search"] != true || fields["feeds"] != false {
 		t.Fatal("readiness log lacks exact safe diagnostics")
@@ -76,6 +85,32 @@ func TestSearchReadinessDeadlineHasOnlySafePageDiagnostics(t *testing.T) {
 	serialized, serializeErr := entries[0].String()
 	if serializeErr != nil || strings.Contains(serialized, "sensitive-test") || strings.Contains(serialized, "?") {
 		t.Fatal("readiness log includes result data or query")
+	}
+}
+
+func TestSearchReadinessStateDiagnosticsAreBoundedAndNeverReadinessProof(t *testing.T) {
+	state := searchFeedState{SearchFields: map[string]string{
+		"error": "sensitive-test DOM ?token=secret", "finished": "boolean", "text": "string",
+	}, SearchBooleans: map[string]bool{"finished": true, "text": true, "notObserved": true}}
+	fields, flags := safeSearchStateFields(state)
+	if fields["error"] != "unknown" || len(flags) != 1 || !flags["finished"] {
+		t.Fatal("only observed booleans and fixed type names may be logged")
+	}
+	for index := 0; index < 100; index++ {
+		state.SearchFields[fmt.Sprintf("field%d", index)] = "object"
+	}
+	fields, _ = safeSearchStateFields(state)
+	if len(fields) != 64 {
+		t.Fatalf("state fields must be bounded, got %d", len(fields))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, err := waitSearchFeeds(ctx, func() error { return nil }, func() (searchFeedState, error) {
+		return searchFeedState{FeedType: "array", FeedCount: 0, Feeds: []Feed{},
+			SearchFields: map[string]string{"finished": "boolean"}, SearchBooleans: map[string]bool{"finished": true}}, nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("an unverified completion field must not make empty feeds ready")
 	}
 }
 
