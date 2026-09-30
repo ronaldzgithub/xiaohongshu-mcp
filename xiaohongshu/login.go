@@ -3,6 +3,7 @@ package xiaohongshu
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -18,22 +19,90 @@ func NewLogin(page *rod.Page) *LoginAction {
 }
 
 func (a *LoginAction) CheckLoginStatus(ctx context.Context) (bool, error) {
-	// 加超时保护：只是查登录态的快速检查，不应无限挂（登录扫码的等待在 Login/WaitForLogin 里）
-	pp := a.page.Context(ctx).Timeout(30 * time.Second)
-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
+	// Account readiness does not require every image/analytics resource to finish.
+	// Keep one bounded context for navigation and typed account-state readback.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	pp := a.page.Context(ctx)
+	return checkLoginStatus(ctx,
+		func() error { return pp.Navigate("https://www.xiaohongshu.com/explore") },
+		func() (loginState, error) { return readLoginState(pp) },
+	)
+}
 
-	time.Sleep(1 * time.Second)
+type loginState struct {
+	Status   string `json:"status"`
+	UserID   string `json:"userId"`
+	Nickname string `json:"nickname"`
+}
 
-	exists, _, err := pp.Has(`.main-container .user .link-wrapper .channel`)
+// The SPA may have usable account state while window.onload still waits on
+// unrelated resources. A missing state is unknown, never proof of logout.
+const loginStateJS = `() => {
+	const unwrap = x => x && typeof x === 'object' && x.__v_isRef === true
+		? (x.value === undefined ? x._value : x.value) : x;
+	const user = unwrap(window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user);
+	if (!user || typeof user !== 'object') return JSON.stringify({status:'pending'});
+	const info = unwrap(user.userInfo) || user;
+	const loggedIn = unwrap(user.loggedIn);
+	if (info.guest === true || (loggedIn === false && document.querySelector('.login-container')))
+		return JSON.stringify({status:'unauthenticated'});
+	const userId = info.userId || info.user_id;
+	if (loggedIn !== false && typeof userId === 'string' && userId.trim())
+		return JSON.stringify({status:'authenticated',userId:userId,nickname:info.nickname||''});
+	return JSON.stringify({status:'pending'});
+}`
+
+func readLoginState(page *rod.Page) (loginState, error) {
+	res, err := page.Eval(loginStateJS)
 	if err != nil {
-		return false, errors.Wrap(err, "check login status failed")
+		return loginState{}, errors.Wrap(err, "read typed login state failed")
 	}
-
-	if !exists {
-		return false, errors.Wrap(err, "login status element not found")
+	var state loginState
+	if err := json.Unmarshal([]byte(res.Value.String()), &state); err != nil {
+		return loginState{}, errors.Wrap(err, "decode typed login state failed")
 	}
+	return state, nil
+}
 
-	return true, nil
+func checkLoginStatus(ctx context.Context, navigate func() error, observe func() (loginState, error)) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, errors.Wrap(err, "login status cancelled")
+	}
+	if err := navigate(); err != nil {
+		return false, errors.Wrap(err, "navigate login status failed")
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, errors.Wrap(err, "typed login state not ready")
+		}
+		state, err := observe()
+		if err != nil {
+			return false, errors.Wrap(err, "check login status failed")
+		}
+		if err := ctx.Err(); err != nil {
+			return false, errors.Wrap(err, "typed login state not ready")
+		}
+		switch state.Status {
+		case "authenticated":
+			if strings.TrimSpace(state.UserID) == "" {
+				return false, errors.New("typed login state is missing account subject")
+			}
+			return true, nil
+		case "unauthenticated":
+			return false, nil
+		case "pending":
+		default:
+			return false, errors.New("typed login state is invalid")
+		}
+		select {
+		case <-ctx.Done():
+			return false, errors.Wrap(ctx.Err(), "typed login state not ready")
+		case <-ticker.C:
+		}
+	}
 }
 
 // CurrentUser 当前登录用户的基础信息。
@@ -47,27 +116,15 @@ type CurrentUser struct {
 func (a *LoginAction) CurrentUser(ctx context.Context) (*CurrentUser, error) {
 	pp := a.page.Context(ctx).Timeout(10 * time.Second)
 
-	res, err := pp.Eval(`() => {
-		const u = window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user;
-		const info = u && u.userInfo && u.userInfo.value !== undefined ? u.userInfo.value : (u && u.userInfo);
-		if (!info || info.guest) return "";
-		return JSON.stringify({nickname: info.nickname, userId: info.userId || info.user_id});
-	}`)
+	state, err := readLoginState(pp)
 	if err != nil {
 		return nil, errors.Wrap(err, "read current user state failed")
 	}
 
-	raw := res.Value.String()
-	if raw == "" {
+	if state.Status != "authenticated" || strings.TrimSpace(state.UserID) == "" {
 		return nil, errors.New("current user not found in page state")
 	}
-
-	var user CurrentUser
-	if err := json.Unmarshal([]byte(raw), &user); err != nil {
-		return nil, errors.Wrap(err, "unmarshal current user failed")
-	}
-
-	return &user, nil
+	return &CurrentUser{Nickname: state.Nickname, UserID: state.UserID}, nil
 }
 
 func (a *LoginAction) Login(ctx context.Context) error {
