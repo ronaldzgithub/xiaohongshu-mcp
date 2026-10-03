@@ -66,6 +66,26 @@ type User struct {
 	Avatar   string `json:"avatar"`
 }
 
+// FeedAuthor retains only access material observed inside this exact author
+// object. It is separate from User so search and comment contracts stay unchanged.
+type FeedAuthor struct {
+	User
+	XsecToken string `json:"xsecToken,omitempty"`
+}
+
+func (u *FeedAuthor) UnmarshalJSON(data []byte) error {
+	type author FeedAuthor
+	var observed author
+	if err := json.Unmarshal(data, &observed); err != nil {
+		return err
+	}
+	if observed.UserID == "" {
+		observed.XsecToken = ""
+	}
+	*u = FeedAuthor(observed)
+	return nil
+}
+
 // InteractInfo 表示互动信息
 type InteractInfo struct {
 	Liked      bool   `json:"liked"`
@@ -122,7 +142,7 @@ type FeedDetail struct {
 	Type         string            `json:"type"`
 	Time         int64             `json:"time"`
 	IPLocation   string            `json:"ipLocation"`
-	User         User              `json:"user"`
+	User         FeedAuthor        `json:"user"`
 	InteractInfo InteractInfo      `json:"interactInfo"`
 	ImageList    []DetailImageInfo `json:"imageList"`
 	Video        *VideoDetail      `json:"video,omitempty"` // 视频笔记才有，图文笔记为 nil
