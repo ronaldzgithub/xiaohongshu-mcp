@@ -121,13 +121,21 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 }
 
 // SearchWithTimeout 供内部 HTTP 合同选择期限，旧调用仍使用默认值。
-func (s *SearchAction) SearchWithTimeout(ctx context.Context, keyword string, timeout time.Duration, filters ...FilterOption) ([]Feed, error) {
+func (s *SearchAction) SearchWithTimeout(ctx context.Context, keyword string, timeout time.Duration, filters ...FilterOption) (feeds []Feed, err error) {
+	stage := "context"
+	var network *searchNetworkDiagnostics
+	defer func() {
+		if err != nil {
+			logSearchFailure(stage, err, network)
+		}
+	}()
 	ctx, cancel, err := searchContext(ctx, timeout)
 	if err != nil {
 		return nil, err
 	}
 	defer cancel()
 	// 先校验筛选取值，必须在导航之前——写错的值不该先向平台发一次请求再报错。
+	stage = "filter_validation"
 	pending, err := collectFilters(filters)
 	if err != nil {
 		return nil, err
@@ -135,7 +143,9 @@ func (s *SearchAction) SearchWithTimeout(ctx context.Context, keyword string, ti
 
 	// 导航、数据读取与筛选共用期限；调用方更短的期限仍然有效。
 	page := s.page.Context(ctx)
-	network, stopObserving := observeSearchNetwork(page)
+	stage = "network_observer"
+	var stopObserving func()
+	network, stopObserving = observeSearchNetwork(page)
 	defer stopObserving()
 	observe := func() (searchFeedState, error) {
 		state, err := readSearchFeeds(page)
@@ -144,13 +154,17 @@ func (s *SearchAction) SearchWithTimeout(ctx context.Context, keyword string, ti
 	}
 
 	searchURL := makeSearchURL(keyword)
-	feeds, err := waitSearchFeeds(ctx,
+	if ctx.Err() == nil {
+		stage = "initial_results"
+	}
+	feeds, err = waitSearchFeeds(ctx,
 		func() error { return page.Navigate(searchURL) },
 		observe,
 	)
 	if err != nil {
 		return nil, err
 	}
+	stage = "result_pacing"
 	humanize.Delay(ctx, humanize.AfterNavigate)
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("search result deadline: %w", err)
@@ -158,16 +172,19 @@ func (s *SearchAction) SearchWithTimeout(ctx context.Context, keyword string, ti
 
 	if len(pending) > 0 {
 		// 悬停在筛选按钮上展开面板
+		stage = "filter_button"
 		filterButton, err := page.Element(`div.filter`)
 		if err != nil {
 			return nil, &searchStageError{"等待筛选按钮失败", err}
 		}
+		stage = "filter_hover"
 		if err := humanize.Hover(filterButton); err != nil {
 			return nil, &searchStageError{"悬停筛选按钮失败", err}
 		}
 		humanize.Delay(ctx, humanize.BeforeClick)
 
 		// 等待筛选面板出现
+		stage = "filter_panel"
 		if err := page.Wait(rod.Eval(`() => document.querySelector('div.filter-panel') !== null`)); err != nil {
 			return nil, &searchStageError{"等待筛选面板失败", err}
 		}
@@ -178,19 +195,23 @@ func (s *SearchAction) SearchWithTimeout(ctx context.Context, keyword string, ti
 		// 用 ClickNoWait：筛选面板是 hover 浮层，rod 的 WaitInteractable 会误判被遮挡而死等；
 		// ClickNoWait 移进面板内选项（维持 hover、面板不关）再点。
 		for _, pf := range pending {
+			stage = "filter_lookup"
 			option, err := findFilterOption(page, pf)
 			if err != nil {
 				return nil, &searchStageError{"查找筛选选项失败", err}
 			}
 			humanize.Delay(ctx, humanize.BeforeClick)
+			stage = "filter_click"
 			if err := humanize.ClickNoWait(option); err != nil {
 				return nil, &searchStageError{"点击筛选选项失败", err}
 			}
 		}
 
+		stage = "filter_change"
 		if err := waitFeedsChanged(ctx, before, 15*time.Second, func() string { return readFeedIDs(page) }); err != nil {
 			return nil, err
 		}
+		stage = "filtered_results"
 		feeds, err = waitSearchFeeds(ctx, func() error { return nil },
 			observe)
 		if err != nil {
@@ -224,6 +245,54 @@ type searchStageError struct {
 
 func (e *searchStageError) Error() string { return e.stage }
 func (e *searchStageError) Unwrap() error { return e.cause }
+
+// A fixed vocabulary makes failures observable without logging err.Error(),
+// search terms, page content, cookies, result identifiers or arbitrary URLs.
+// No native request identity is available here; correlation remains by time.
+func logSearchFailure(stage string, err error, network *searchNetworkDiagnostics) {
+	if err == nil {
+		return
+	}
+	switch stage {
+	case "context", "filter_validation", "network_observer", "initial_results", "result_pacing",
+		"filter_button", "filter_hover", "filter_panel", "filter_lookup", "filter_click", "filter_change", "filtered_results":
+	default:
+		stage = "unknown"
+	}
+	class := "error"
+	if errors.Is(err, context.DeadlineExceeded) {
+		class = "deadline"
+	} else if errors.Is(err, context.Canceled) {
+		class = "cancel"
+	}
+	point := "stage"
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		if typed, ok := cause.(*searchStageError); ok {
+			switch typed.stage {
+			case "navigate search failed":
+				point = "navigate"
+			case "read search feeds failed":
+				point = "read"
+			case "decode search feeds failed":
+				point = "decode"
+			}
+		}
+	}
+	fields := logrus.Fields{"stage": stage, "failure_point": point, "error_class": class,
+		"network_observed": network != nil}
+	if network != nil {
+		count, requests := network.snapshot()
+		fields["search_request_count"] = count
+		encoded, _ := json.Marshal(requests)
+		fields["search_requests"] = string(encoded)
+		enabled, total, failures := network.startupSnapshot()
+		fields["network_enable_status"] = enabled
+		fields["page_request_count"] = total
+		encoded, _ = json.Marshal(failures)
+		fields["search_startup_script_failures"] = string(encoded)
+	}
+	logrus.WithFields(fields).Warn("search_operation_failed")
+}
 
 // 只等待所需的搜索数据；图片、埋点和页面动画不影响可读结果。
 const searchFeedStateJS = `() => {
