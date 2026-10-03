@@ -245,6 +245,7 @@ type searchFeedState struct {
 	FeedCount       int                       `json:"feedCount"`
 	SearchFields    map[string]string         `json:"searchFields"`
 	SearchBooleans  map[string]bool           `json:"searchBooleans"`
+	Readiness       searchReadinessEvidence   `json:"readiness"`
 	Network         *searchNetworkDiagnostics `json:"-"`
 }
 
@@ -307,6 +308,8 @@ func logSearchFailure(stage string, err error, network *searchNetworkDiagnostics
 
 // 只等待所需的搜索数据；图片、埋点和页面动画不影响可读结果。
 const searchFeedStateJS = `() => {
+	const unwrap = x => x && typeof x === 'object' && x.__v_isRef === true
+		? (x.value === undefined ? x._value : x.value) : x;
 	const search = window.__INITIAL_STATE__?.search;
 	const feeds = search?.feeds;
 	const data = Array.isArray(feeds) ? feeds
@@ -327,13 +330,31 @@ const searchFeedStateJS = `() => {
 			} catch (_) { searchFields[key] = 'unreadable'; }
 		}
 	}
+	const visible = el => !!el && el.getClientRects().length > 0 &&
+		getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+	const user = unwrap(window.__INITIAL_STATE__?.user), info = unwrap(user?.userInfo) || user;
+	const loggedIn = unwrap(user?.loggedIn), userId = info?.userId || info?.user_id;
+	const loginVisible = visible(document.querySelector('.login-container'));
+	const captchaPath = '/website-login/captcha';
+	const challengeVisible = window.location.pathname === captchaPath || Array.from(document.querySelectorAll('iframe')).some(el => {
+		try { return visible(el) && new URL(el.src, location.href).pathname === captchaPath; } catch (_) { return false; }
+	});
+	const storeState = unwrap(search?.state), hasMore = unwrap(search?.hasMore);
+	const keyword = new URLSearchParams(window.location.search).get('keyword');
+	const context = unwrap(search?.searchContext), contextKeyword = unwrap(context?.keyword);
+	const readiness = {documentComplete:document.readyState === 'complete', loginVisible, challengeVisible,
+		authenticated:loggedIn !== false && typeof userId === 'string' && userId.trim().length > 0,
+		unauthenticated:info?.guest === true || (loggedIn === false && loginVisible),
+		storeLoading:storeState === 'loading', storeSuccess:storeState === 'success', storeError:storeState === 'error',
+		hasMoreKnown:typeof hasMore === 'boolean', hasMore:hasMore === true,
+		queryMatches:typeof keyword === 'string' && keyword.length > 0 && contextKeyword === keyword};
 	// 空数组可能只是初始化，不能证明搜索已完成。
 	return JSON.stringify({ready:Array.isArray(data) && data.length > 0, feeds:Array.isArray(data) ? data : null,
 		origin:window.location.origin, path:window.location.pathname,
 		hasInitialState:window.__INITIAL_STATE__ !== undefined,
 		hasSearch:search !== undefined, hasFeeds:feeds !== undefined,
 		feedType:type(data), feedCount:Array.isArray(data) ? data.length : -1,
-		searchFields, searchBooleans});
+		searchFields, searchBooleans, readiness});
 }`
 
 func readSearchFeeds(page *rod.Page) (searchFeedState, error) {
@@ -400,6 +421,9 @@ func searchNotReadyError(cause error, state searchFeedState) error {
 	fields["feeds_count"] = state.FeedCount
 	fields["search_fields"] = fieldTypes
 	fields["search_booleans"] = booleans
+	for key, value := range searchReadinessFields(state) {
+		fields[key] = value
+	}
 	if state.Network != nil {
 		count, requests := state.Network.snapshot()
 		fields["search_request_count"] = count

@@ -200,10 +200,14 @@ func TestSearchReadinessDeadlineHasOnlySafePageDiagnostics(t *testing.T) {
 		t.Fatal("diagnostic includes result data or query")
 	}
 	entries := hook.AllEntries()
-	if len(entries) != 1 || entries[0].Message != "search_data_not_ready" || len(entries[0].Data) != 9 {
+	if len(entries) != 1 || entries[0].Message != "search_data_not_ready" || len(entries[0].Data) != 27 {
 		t.Fatalf("expected one bounded readiness log, got %d entries", len(entries))
 	}
 	fields := entries[0].Data
+	if fields["readiness_class"] != "unresolved" || fields["query_matches"] != false ||
+		fields["startup_scripts_pending"] != 0 || fields["search_requests_completed_2xx"] != 0 {
+		t.Fatal("new readiness evidence must remain bounded and cannot infer completion")
+	}
 	if fields["feeds_type"] != "array" || fields["feeds_count"] != 0 ||
 		fields["search_fields"].(map[string]string)["error"] != "string" ||
 		fields["search_booleans"].(map[string]bool)["loading"] != true {
