@@ -885,3 +885,61 @@ func (s *XiaohongshuService) GetMyProfile(ctx context.Context, tab string) (*Use
 
 	return response, nil
 }
+
+// GetFeedDetailSnapshot reads the requested object once under the caller's
+// bounded context. It does not load comments or wait for whole-page stability.
+func (s *XiaohongshuService) GetFeedDetailSnapshot(ctx context.Context, feedID, xsecToken string) (*FeedDetailResponse, error) {
+	return boundedDetailSnapshot(ctx, func() (*FeedDetailResponse, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		b := newBrowser()
+		defer b.Close()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		page := b.NewPage()
+		defer page.Close()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result, err := xiaohongshu.NewFeedDetailAction(page).GetFeedDetailSnapshot(ctx, feedID, xsecToken)
+		if err != nil {
+			return nil, err
+		}
+		return &FeedDetailResponse{FeedID: feedID, Data: result}, nil
+	})
+}
+
+// Existing browser creation/cleanup has no context API. Bound this handler's
+// wait as well; a late browser owner checks ctx before creating a page or
+// navigating and only performs local cleanup after cancellation.
+func boundedDetailSnapshot(ctx context.Context, read func() (*FeedDetailResponse, error)) (*FeedDetailResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type outcome struct {
+		value *FeedDetailResponse
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		var result outcome
+		defer func() {
+			if recover() != nil {
+				result = outcome{err: fmt.Errorf("detail snapshot browser failure")}
+			}
+			done <- result
+		}()
+		result.value, result.err = read()
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return result.value, result.err
+	}
+}

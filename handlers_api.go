@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -238,7 +239,16 @@ func (s *AppServer) getFeedDetailHandler(c *gin.Context) {
 	var result *FeedDetailResponse
 	var err error
 
-	if req.CommentConfig != nil {
+	if len(req.TimeoutSeconds) > 0 {
+		timeout, timeoutErr := detailSnapshotTimeout(req)
+		if timeoutErr != nil {
+			respondError(c, http.StatusBadRequest, "INVALID_REQUEST", "Invalid detail snapshot timeout", "bounded snapshot requires 1..25 seconds and no comment loading")
+			return
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
+		defer cancel()
+		result, err = s.xiaohongshuService.GetFeedDetailSnapshot(ctx, req.FeedID, req.XsecToken)
+	} else if req.CommentConfig != nil {
 		config := xiaohongshu.CommentLoadConfig{
 			ClickMoreReplies:    req.CommentConfig.ClickMoreReplies,
 			MaxRepliesThreshold: req.CommentConfig.MaxRepliesThreshold,
@@ -466,4 +476,14 @@ func (s *AppServer) likeNotificationHandler(c *gin.Context) {
 	}
 
 	respondSuccess(c, map[string]any{"data": result}, "操作成功")
+}
+
+// Explicit timeout selects a single read-only snapshot; legacy requests retain
+// their existing comment-loading behavior.
+func detailSnapshotTimeout(req FeedDetailRequest) (time.Duration, error) {
+	var seconds int
+	if req.LoadAllComments || req.CommentConfig != nil || json.Unmarshal(req.TimeoutSeconds, &seconds) != nil || seconds < 1 || seconds > 25 {
+		return 0, errors.New("invalid bounded detail snapshot timeout")
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
