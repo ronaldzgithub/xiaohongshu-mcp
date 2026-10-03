@@ -1,6 +1,10 @@
 package main
 
-import "github.com/xpzouying/xiaohongshu-mcp/xiaohongshu"
+import (
+	"encoding/json"
+
+	"github.com/xpzouying/xiaohongshu-mcp/xiaohongshu"
+)
 
 // HTTP API 响应类型
 
@@ -55,8 +59,9 @@ type FeedDetailRequest struct {
 }
 
 type SearchFeedsRequest struct {
-	Keyword string                   `json:"keyword" binding:"required"`
-	Filters xiaohongshu.FilterOption `json:"filters,omitempty"`
+	Keyword        string                   `json:"keyword" binding:"required"`
+	Filters        xiaohongshu.FilterOption `json:"filters,omitempty"`
+	TimeoutSeconds json.RawMessage          `json:"timeout_seconds,omitempty"`
 }
 
 // FeedDetailResponse Feed详情响应

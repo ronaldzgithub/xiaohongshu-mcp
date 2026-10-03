@@ -90,20 +90,50 @@ type SearchAction struct {
 	page *rod.Page
 }
 
+const DefaultSearchTimeout = 25 * time.Second
+const MaxSearchTimeout = 45 * time.Second
+
+// ValidateSearchTimeout 只允许搜索调用选择有界的整数秒期限。
+func ValidateSearchTimeout(timeout time.Duration) error {
+	if timeout < DefaultSearchTimeout || timeout > MaxSearchTimeout || timeout%time.Second != 0 {
+		return errors.New("timeout_seconds must be an integer between 25 and 45")
+	}
+	return nil
+}
+
+func searchContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc, error) {
+	if err := ValidateSearchTimeout(timeout); err != nil {
+		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	return ctx, cancel, nil
+}
+
 func NewSearchAction(page *rod.Page) *SearchAction {
 	return &SearchAction{page: page}
 }
 
 func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...FilterOption) ([]Feed, error) {
+	return s.SearchWithTimeout(ctx, keyword, DefaultSearchTimeout, filters...)
+}
+
+// SearchWithTimeout 供内部 HTTP 合同选择期限，旧调用仍使用默认值。
+func (s *SearchAction) SearchWithTimeout(ctx context.Context, keyword string, timeout time.Duration, filters ...FilterOption) ([]Feed, error) {
+	ctx, cancel, err := searchContext(ctx, timeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
 	// 先校验筛选取值，必须在导航之前——写错的值不该先向平台发一次请求再报错。
 	pending, err := collectFilters(filters)
 	if err != nil {
 		return nil, err
 	}
 
-	// 搜索必须在调用方的 30s HTTP 超时前返回；导航与数据读取共用期限。
-	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
-	defer cancel()
+	// 导航、数据读取与筛选共用期限；调用方更短的期限仍然有效。
 	page := s.page.Context(ctx)
 	network, stopObserving := observeSearchNetwork(page)
 	defer stopObserving()

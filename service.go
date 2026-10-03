@@ -548,6 +548,17 @@ func (s *XiaohongshuService) ListFeeds(ctx context.Context) (*FeedsListResponse,
 }
 
 func (s *XiaohongshuService) SearchFeeds(ctx context.Context, keyword string, filters ...xiaohongshu.FilterOption) (*FeedsListResponse, error) {
+	return s.SearchFeedsWithTimeout(ctx, keyword, xiaohongshu.DefaultSearchTimeout, filters...)
+}
+
+func (s *XiaohongshuService) SearchFeedsWithTimeout(ctx context.Context, keyword string, timeout time.Duration, filters ...xiaohongshu.FilterOption) (*FeedsListResponse, error) {
+	// 参数与取消状态必须在创建浏览器前检查。
+	if err := xiaohongshu.ValidateSearchTimeout(timeout); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	b := newBrowser()
 	defer b.Close()
 
@@ -556,7 +567,7 @@ func (s *XiaohongshuService) SearchFeeds(ctx context.Context, keyword string, fi
 
 	action := xiaohongshu.NewSearchAction(page)
 
-	feeds, err := action.Search(ctx, keyword, filters...)
+	feeds, err := action.SearchWithTimeout(ctx, keyword, timeout, filters...)
 	if err != nil {
 		return nil, err
 	}

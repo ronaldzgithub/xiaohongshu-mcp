@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/xpzouying/xiaohongshu-mcp/cookies"
 	"github.com/xpzouying/xiaohongshu-mcp/xiaohongshu"
@@ -174,6 +176,7 @@ func (s *AppServer) listFeedsHandler(c *gin.Context) {
 func (s *AppServer) searchFeedsHandler(c *gin.Context) {
 	var keyword string
 	var filters xiaohongshu.FilterOption
+	timeout := xiaohongshu.DefaultSearchTimeout
 
 	switch c.Request.Method {
 	case http.MethodPost:
@@ -186,6 +189,12 @@ func (s *AppServer) searchFeedsHandler(c *gin.Context) {
 		}
 		keyword = searchReq.Keyword
 		filters = searchReq.Filters
+		var err error
+		timeout, err = searchRequestTimeout(searchReq.TimeoutSeconds)
+		if err != nil {
+			respondError(c, http.StatusBadRequest, "INVALID_REQUEST", "请求参数错误", err.Error())
+			return
+		}
 	default:
 		keyword = c.Query("keyword")
 	}
@@ -196,7 +205,7 @@ func (s *AppServer) searchFeedsHandler(c *gin.Context) {
 		return
 	}
 
-	result, err := s.xiaohongshuService.SearchFeeds(c.Request.Context(), keyword, filters)
+	result, err := s.xiaohongshuService.SearchFeedsWithTimeout(c.Request.Context(), keyword, timeout, filters)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "SEARCH_FEEDS_FAILED",
 			"搜索Feeds失败", err.Error())
@@ -204,6 +213,17 @@ func (s *AppServer) searchFeedsHandler(c *gin.Context) {
 	}
 
 	respondSuccess(c, result, "搜索Feeds成功")
+}
+
+func searchRequestTimeout(raw json.RawMessage) (time.Duration, error) {
+	if len(raw) == 0 {
+		return xiaohongshu.DefaultSearchTimeout, nil
+	}
+	var seconds int
+	if err := json.Unmarshal(raw, &seconds); err != nil || seconds < 25 || seconds > 45 {
+		return 0, errors.New("timeout_seconds must be an integer between 25 and 45")
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 // getFeedDetailHandler 获取Feed详情
