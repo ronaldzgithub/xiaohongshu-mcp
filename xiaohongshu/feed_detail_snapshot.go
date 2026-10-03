@@ -15,7 +15,35 @@ const detailSnapshotJS = `(id) => {
      typeof entry.note.title !== 'string' || typeof entry.note.desc !== 'string' ||
      typeof entry.note.type !== 'string' || !entry.comments ||
      typeof entry.comments !== 'object' || Array.isArray(entry.comments)) return '';
- return JSON.stringify(entry);
+ // Optional access evidence never delays an otherwise ready note snapshot.
+ // Copy only hrefs already present for this exact author; never follow them.
+ const snapshot = {...entry};
+ delete snapshot._author_profile_origin;
+ delete snapshot._author_profile_links;
+ const author = entry.note.user;
+ if (typeof author?.userId === 'string' && author.userId && !author.xsecToken) {
+  try {
+   const links = document.links;
+   if (links.length <= 256) {
+    const candidates = [];
+    for (let i = 0; i < links.length; i++) {
+     const href = links[i].getAttribute('href');
+     if (!href || href.length > 2048) continue;
+     try {
+      const target = new URL(href, window.location.origin);
+      if (target.pathname !== '/user/profile/' + author.userId) continue;
+      candidates.push(href);
+      if (candidates.length > 32) break;
+     } catch (_) {}
+    }
+    if (candidates.length <= 32) {
+     snapshot._author_profile_origin = window.location.origin;
+     snapshot._author_profile_links = candidates;
+    }
+   }
+  } catch (_) {}
+ }
+ return JSON.stringify(snapshot);
 }`
 
 func (f *FeedDetailAction) GetFeedDetailSnapshot(ctx context.Context, feedID, token string) (*FeedDetailResponse, error) {
@@ -72,7 +100,9 @@ func decodeDetailSnapshot(raw, feedID string) (*FeedDetailResponse, error) {
 			Desc  *string `json:"desc"`
 			Type  *string `json:"type"`
 		} `json:"note"`
-		Comments json.RawMessage `json:"comments"`
+		Comments     json.RawMessage `json:"comments"`
+		AuthorOrigin string          `json:"_author_profile_origin"`
+		AuthorLinks  []string        `json:"_author_profile_links"`
 	}
 	if json.Unmarshal([]byte(raw), &entry) != nil {
 		return nil, errors.New("invalid detail snapshot JSON")
@@ -83,6 +113,9 @@ func decodeDetailSnapshot(raw, feedID string) (*FeedDetailResponse, error) {
 	var result FeedDetailResponse
 	if json.Unmarshal([]byte(raw), &result) != nil {
 		return nil, errors.New("invalid detail snapshot fields")
+	}
+	if result.Note.User.XsecToken == "" {
+		result.Note.User.XsecToken = authorAccessFromLinks(result.Note.User.UserID, entry.AuthorOrigin, entry.AuthorLinks)
 	}
 	return &result, nil
 }

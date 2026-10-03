@@ -16,7 +16,8 @@ func TestDetailSnapshotReadsTargetWithoutWholePageStability(t *testing.T) {
 	if err != nil || result == nil || navigations != 1 || reads != 1 {
 		t.Fatal("expected one exact snapshot", err)
 	}
-	if strings.Contains(detailSnapshotJS, "document") || !strings.Contains(detailSnapshotJS, "noteDetailMap?.[id]") {
+	if !strings.Contains(detailSnapshotJS, "noteDetailMap?.[id]") ||
+		strings.Contains(detailSnapshotJS, "WaitDOM") || strings.Contains(detailSnapshotJS, "fetch(") {
 		t.Fatal("readiness must use requested object")
 	}
 }
