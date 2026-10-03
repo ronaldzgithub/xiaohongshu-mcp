@@ -165,9 +165,8 @@ func (s *SearchAction) SearchWithTimeout(ctx context.Context, keyword string, ti
 		return nil, err
 	}
 	stage = "result_pacing"
-	humanize.Delay(ctx, humanize.AfterNavigate)
-	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("search result deadline: %w", err)
+	if err := prepareSearchFilterInteraction(ctx, pending); err != nil {
+		return nil, err
 	}
 
 	if len(pending) > 0 {
@@ -220,6 +219,18 @@ func (s *SearchAction) SearchWithTimeout(ctx context.Context, keyword string, ti
 	}
 
 	return onlyNotes(feeds), nil
+}
+
+func prepareSearchFilterInteraction(ctx context.Context, pending []pendingFilter) error {
+	// Pacing precedes an actual filter interaction. An unfiltered read already
+	// has its result and must not spend its remaining deadline waiting idly.
+	if len(pending) > 0 {
+		humanize.Delay(ctx, humanize.AfterNavigate)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("search result deadline: %w", err)
+	}
+	return nil
 }
 
 type searchFeedState struct {
