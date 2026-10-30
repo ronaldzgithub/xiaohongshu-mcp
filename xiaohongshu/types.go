@@ -145,7 +145,9 @@ type FeedDetail struct {
 	User         FeedAuthor        `json:"user"`
 	InteractInfo InteractInfo      `json:"interactInfo"`
 	ImageList    []DetailImageInfo `json:"imageList"`
-	Video        *VideoDetail      `json:"video,omitempty"` // 视频笔记才有，图文笔记为 nil
+	// TagList 保留页面状态中的话题标签，供调用方独立比对发布的话题。
+	TagList []DetailTag  `json:"tagList,omitempty"`
+	Video   *VideoDetail `json:"video,omitempty"` // 视频笔记才有，图文笔记为 nil
 }
 
 // VideoDetail 详情页的视频信息，按页面 note.video 原样映射，不替调用方挑档位。
@@ -255,6 +257,13 @@ type VideoSubtitle struct {
 	Language string `json:"language"`
 	Format   int    `json:"format"`
 	Type     int    `json:"type"`
+}
+
+// DetailTag 详情页话题标签
+type DetailTag struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 // DetailImageInfo 表示详情页的图片信息

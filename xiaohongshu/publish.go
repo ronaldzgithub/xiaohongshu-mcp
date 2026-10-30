@@ -51,6 +51,21 @@ type PublishResult struct {
 // 调用方必须查询结果或转人工，不能以相同请求再次发布。
 var ErrPublishResultUnverifiable = stderrors.New("发布结果不可验证")
 
+// ErrPublishNotSubmitted 表示失败发生在点击发布之前：编辑页尚未提交，平台不会生成笔记。
+// 点击本身失败或点击之后的失败不能使用这个错误，必须保持 UNKNOWN 或普通失败。
+var ErrPublishNotSubmitted = stderrors.New("发布尚未提交")
+
+// NotSubmitted 把点击发布之前的失败标记为确定未提交。
+func NotSubmitted(err error) error {
+	if err == nil {
+		return nil
+	}
+	if stderrors.Is(err, ErrPublishNotSubmitted) {
+		return err
+	}
+	return stderrors.Join(ErrPublishNotSubmitted, err)
+}
+
 var feedIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{24}$`)
 
 const (
@@ -65,7 +80,7 @@ func NewPublishImageAction(page *rod.Page) (*PublishAction, error) {
 	pp := page.Timeout(300 * time.Second)
 
 	if err := pp.Navigate(urlOfPublic); err != nil {
-		return nil, errors.Wrap(err, "导航到发布页面失败")
+		return nil, NotSubmitted(errors.Wrap(err, "导航到发布页面失败"))
 	}
 
 	if err := pp.WaitLoad(); err != nil {
@@ -80,7 +95,7 @@ func NewPublishImageAction(page *rod.Page) (*PublishAction, error) {
 
 	if err := mustClickPublishTab(pp, "上传图文"); err != nil {
 		logrus.Errorf("点击上传图文 TAB 失败: %v", err)
-		return nil, err
+		return nil, NotSubmitted(err)
 	}
 
 	time.Sleep(1 * time.Second)
@@ -99,7 +114,7 @@ func (p *PublishAction) Publish(ctx context.Context, content PublishImageContent
 // PublishWithResult 发布图文并返回可复验的稳定对象证据。
 func (p *PublishAction) PublishWithResult(ctx context.Context, content PublishImageContent) (*PublishResult, error) {
 	if len(content.ImagePaths) == 0 {
-		return nil, errors.New("图片不能为空")
+		return nil, NotSubmitted(errors.New("图片不能为空"))
 	}
 	if err := p.beginSubmission(); err != nil {
 		return nil, err
@@ -109,7 +124,7 @@ func (p *PublishAction) PublishWithResult(ctx context.Context, content PublishIm
 	page := p.page.Context(ctx).Timeout(300 * time.Second)
 
 	if err := uploadImages(page, content.ImagePaths); err != nil {
-		return nil, errors.Wrap(err, "小红书上传图片失败")
+		return nil, NotSubmitted(errors.Wrap(err, "小红书上传图片失败"))
 	}
 
 	tags := content.Tags
@@ -383,17 +398,35 @@ func waitForUploadComplete(page *rod.Page, expectedCount int) error {
 }
 
 func submitPublish(ctx context.Context, page *rod.Page, title, content string, tags []string, scheduleTime *time.Time, isOriginal bool, visibility string, products []string) (*PublishResult, error) {
+	// 编辑页上的所有准备步骤都发生在点击发布之前；失败时平台不会生成笔记。
+	if err := fillPublishForm(ctx, page, title, content, tags, scheduleTime, isOriginal, visibility, products); err != nil {
+		return nil, NotSubmitted(err)
+	}
+	btn, err := waitForPublishButtonClickable(page, 15*time.Second)
+	if err != nil {
+		return nil, NotSubmitted(err)
+	}
+	// 点击可能已经送达页面；从这里开始的失败不能宣称未提交。
+	if err := clickResolvedPublishButton(page, btn); err != nil {
+		return nil, err
+	}
+
+	// 离开编辑页不等于发布成功。只有受信 URL 给出稳定 feed_id 才返回成功。
+	return waitPublishResult(page, 15*time.Second)
+}
+
+func fillPublishForm(ctx context.Context, page *rod.Page, title, content string, tags []string, scheduleTime *time.Time, isOriginal bool, visibility string, products []string) error {
 	titleElem, err := page.Element("div.d-input input")
 	if err != nil {
-		return nil, errors.Wrap(err, "查找标题输入框失败")
+		return errors.Wrap(err, "查找标题输入框失败")
 	}
 	if err := humanize.Type(ctx, titleElem, title); err != nil {
-		return nil, errors.Wrap(err, "输入标题失败")
+		return errors.Wrap(err, "输入标题失败")
 	}
 
 	humanize.Delay(ctx, humanize.AfterType)
 	if err := checkTitleMaxLength(page); err != nil {
-		return nil, err
+		return err
 	}
 	slog.Info("检查标题长度：通过")
 
@@ -401,54 +434,48 @@ func submitPublish(ctx context.Context, page *rod.Page, title, content string, t
 
 	contentElem, err := getContentElement(page, contentElemTimeout)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := humanize.Type(ctx, contentElem, content); err != nil {
-		return nil, errors.Wrap(err, "输入正文失败")
+		return errors.Wrap(err, "输入正文失败")
 	}
 	if err := waitAndClickTitleInput(titleElem); err != nil {
-		return nil, err
+		return err
 	}
 	if err := inputTags(ctx, contentElem, tags); err != nil {
-		return nil, err
+		return err
 	}
 
 	humanize.Delay(ctx, humanize.AfterType)
 
 	if err := checkContentMaxLength(page); err != nil {
-		return nil, err
+		return err
 	}
 	slog.Info("检查正文长度：通过")
 
 	if scheduleTime != nil {
 		if err := setSchedulePublish(ctx, page, *scheduleTime); err != nil {
-			return nil, errors.Wrap(err, "设置定时发布失败")
+			return errors.Wrap(err, "设置定时发布失败")
 		}
 		slog.Info("定时发布设置完成", "schedule_time", scheduleTime.Format("2006-01-02 15:04"))
 	}
 
 	if err := setVisibility(page, visibility); err != nil {
-		return nil, errors.Wrap(err, "设置可见范围失败")
+		return errors.Wrap(err, "设置可见范围失败")
 	}
 
 	// 处理原创声明：显式请求了原创但设置失败 → 报错中止，不静默发成非原创（避免"以为原创其实不是"）
 	if isOriginal {
 		if err := setOriginal(page); err != nil {
-			return nil, errors.Wrap(err, "设置原创声明失败（已请求原创，中止发布）")
+			return errors.Wrap(err, "设置原创声明失败（已请求原创，中止发布）")
 		}
 		slog.Info("已声明原创")
 	}
 
 	if err := bindProducts(ctx, page, products); err != nil {
-		return nil, errors.Wrap(err, "绑定商品失败")
+		return errors.Wrap(err, "绑定商品失败")
 	}
-
-	if err := clickPublishButton(page); err != nil {
-		return nil, err
-	}
-
-	// 离开编辑页不等于发布成功。只有受信 URL 给出稳定 feed_id 才返回成功。
-	return waitPublishResult(page, 15*time.Second)
+	return nil
 }
 
 // parsePublishedFeedURL 只接受仓库现有读取链路使用的公开笔记 URL。
@@ -528,7 +555,12 @@ func clickPublishButton(page *rod.Page) error {
 	if err != nil {
 		return err
 	}
+	return clickResolvedPublishButton(page, btn)
+}
 
+// clickResolvedPublishButton only performs the click; the caller already confirmed the button is clickable.
+// The click may already have reached the page, so a failure here must not be marked as not submitted.
+func clickResolvedPublishButton(page *rod.Page, btn *publishButton) error {
 	if btn.isWidget {
 		return clickPublishWidget(page, btn.elem)
 	}

@@ -105,6 +105,12 @@ func (s *AppServer) publishHandler(c *gin.Context) {
 	result, err := s.xiaohongshuService.PublishContent(c.Request.Context(), &req)
 	if err != nil {
 		switch {
+		case errors.Is(err, xiaohongshu.ErrPublishNotSubmitted):
+			// Every failure on this path happens before the publish click, so
+			// the platform has no note. Details stay out of the response.
+			respondError(c, http.StatusUnprocessableEntity, "PUBLISH_NOT_SUBMITTED",
+				"发布未提交；平台未生成笔记", nil)
+			return
 		case errors.Is(err, xiaohongshu.ErrPublishResultUnverifiable), errors.Is(err, ErrPublishAttemptInFlight):
 			respondError(c, http.StatusAccepted, "PUBLISH_RESULT_UNKNOWN",
 				"发布结果不可验证；必须按 request_id 查询或转人工，禁止重发", result)
@@ -140,6 +146,19 @@ func bindPublishIdentity(c *gin.Context, req *PublishRequest) error {
 		req.IdempotencyKey = headerIdempotencyKey
 	}
 	return nil
+}
+
+// publishReadinessHandler reports the publish contract and the external action
+// switch. It is read-only and never opens a browser.
+func (s *AppServer) publishReadinessHandler(c *gin.Context) {
+	respondSuccess(c, map[string]any{
+		"schema":                       "xiaohongshu-mcp.publish-readiness/v1",
+		"external_actions_enabled":     externalActionsEnabled(),
+		"image_files_supported":        true,
+		"not_submitted_classification": true,
+		"max_image_files":              maxPublishImageFiles,
+		"max_image_file_bytes":         maxPublishImageFileBytes,
+	}, "发布能力状态")
 }
 
 // publishVideoHandler 发布视频内容

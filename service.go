@@ -73,18 +73,27 @@ func NewXiaohongshuService() *XiaohongshuService {
 	return service
 }
 
+// PublishImageFile 是受控调用方直接提交的一张图片。
+// 发布前在本服务内重新校验字节摘要和类型，不信任调用方声明。
+type PublishImageFile struct {
+	ContentBase64 string `json:"content_base64"`
+	SHA256        string `json:"sha256"`
+	MediaType     string `json:"media_type"`
+}
+
 // PublishRequest 发布请求
 type PublishRequest struct {
-	RequestID      string   `json:"request_id"`
-	IdempotencyKey string   `json:"idempotency_key"`
-	Title          string   `json:"title" binding:"required"`
-	Content        string   `json:"content" binding:"required"`
-	Images         []string `json:"images" binding:"required,min=1"`
-	Tags           []string `json:"tags,omitempty"`
-	ScheduleAt     string   `json:"schedule_at,omitempty"` // 定时发布时间，ISO8601格式，为空则立即发布
-	IsOriginal     bool     `json:"is_original,omitempty"` // 是否声明原创
-	Visibility     string   `json:"visibility,omitempty"`  // 可见范围: "公开可见"(默认), "仅自己可见", "仅互关好友可见"
-	Products       []string `json:"products,omitempty"`    // 商品关键词列表，用于绑定带货商品
+	RequestID      string             `json:"request_id"`
+	IdempotencyKey string             `json:"idempotency_key"`
+	Title          string             `json:"title" binding:"required"`
+	Content        string             `json:"content" binding:"required"`
+	Images         []string           `json:"images,omitempty"`      // URL 或本地路径；与 image_files 二选一
+	ImageFiles     []PublishImageFile `json:"image_files,omitempty"` // 已校验摘要的图片字节；与 images 二选一
+	Tags           []string           `json:"tags,omitempty"`
+	ScheduleAt     string             `json:"schedule_at,omitempty"` // 定时发布时间，ISO8601格式，为空则立即发布
+	IsOriginal     bool               `json:"is_original,omitempty"` // 是否声明原创
+	Visibility     string             `json:"visibility,omitempty"`  // 可见范围: "公开可见"(默认), "仅自己可见", "仅互关好友可见"
+	Products       []string           `json:"products,omitempty"`    // 商品关键词列表，用于绑定带货商品
 }
 
 // LoginStatusResponse 登录状态响应
@@ -258,7 +267,7 @@ func (s *XiaohongshuService) waitScanInBackground(
 // PublishContent 发布内容
 func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishRequest) (response *PublishResponse, err error) {
 	if err := requireExternalActionsEnabled(); err != nil {
-		return nil, err
+		return nil, xiaohongshu.NotSubmitted(err)
 	}
 	if req == nil || strings.TrimSpace(req.RequestID) == "" || strings.TrimSpace(req.IdempotencyKey) == "" {
 		return nil, ErrPublishIdentityRequired
@@ -278,23 +287,39 @@ func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishReq
 
 	// 验证标题长度（小红书限制：最大20个字）
 	if xhsutil.CalcTitleLength(req.Title) > 20 {
-		return nil, fmt.Errorf("标题长度超过限制")
+		return nil, xiaohongshu.NotSubmitted(fmt.Errorf("标题长度超过限制"))
 	}
 
-	processImage := s.processImage
-	if processImage == nil {
-		processImage = s.processImages
-	}
-	imagePaths, err := processImage(req.Images)
-	if err != nil {
-		return nil, err
+	var imagePaths []string
+	switch {
+	case len(req.ImageFiles) > 0 && len(req.Images) > 0:
+		return nil, xiaohongshu.NotSubmitted(errors.New("images 与 image_files 只能二选一"))
+	case len(req.ImageFiles) > 0:
+		paths, cleanup, materializeErr := materializePublishImageFiles(req.ImageFiles)
+		if materializeErr != nil {
+			return nil, xiaohongshu.NotSubmitted(materializeErr)
+		}
+		defer cleanup()
+		imagePaths = paths
+	case len(req.Images) > 0:
+		processImage := s.processImage
+		if processImage == nil {
+			processImage = s.processImages
+		}
+		paths, processErr := processImage(req.Images)
+		if processErr != nil {
+			return nil, xiaohongshu.NotSubmitted(processErr)
+		}
+		imagePaths = paths
+	default:
+		return nil, xiaohongshu.NotSubmitted(errors.New("必须提供 images 或 image_files"))
 	}
 
 	var scheduleTime *time.Time
 	if req.ScheduleAt != "" {
 		t, err := time.Parse(time.RFC3339, req.ScheduleAt)
 		if err != nil {
-			return nil, fmt.Errorf("定时发布时间格式错误，请使用 ISO8601 格式: %v", err)
+			return nil, xiaohongshu.NotSubmitted(fmt.Errorf("定时发布时间格式错误，请使用 ISO8601 格式: %v", err))
 		}
 
 		// 校验定时发布时间范围：1小时至14天
@@ -303,12 +328,12 @@ func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishReq
 		maxTime := now.Add(14 * 24 * time.Hour)
 
 		if t.Before(minTime) {
-			return nil, fmt.Errorf("定时发布时间必须至少在1小时后，当前设置: %s，最早可选: %s",
-				t.Format("2006-01-02 15:04"), minTime.Format("2006-01-02 15:04"))
+			return nil, xiaohongshu.NotSubmitted(fmt.Errorf("定时发布时间必须至少在1小时后，当前设置: %s，最早可选: %s",
+				t.Format("2006-01-02 15:04"), minTime.Format("2006-01-02 15:04")))
 		}
 		if t.After(maxTime) {
-			return nil, fmt.Errorf("定时发布时间不能超过14天，当前设置: %s，最晚可选: %s",
-				t.Format("2006-01-02 15:04"), maxTime.Format("2006-01-02 15:04"))
+			return nil, xiaohongshu.NotSubmitted(fmt.Errorf("定时发布时间不能超过14天，当前设置: %s，最晚可选: %s",
+				t.Format("2006-01-02 15:04"), maxTime.Format("2006-01-02 15:04")))
 		}
 
 		scheduleTime = &t
@@ -370,7 +395,20 @@ func unknownPublishResponse(req *PublishRequest) *PublishResponse {
 }
 
 func publishRequestFingerprint(req *PublishRequest) (string, error) {
-	raw, err := json.Marshal(req)
+	// 图片字节只以其内容摘要参与指纹：同一幂等键下字节不同即摘要不同。
+	material := *req
+	if len(req.ImageFiles) > 0 {
+		material.ImageFiles = make([]PublishImageFile, len(req.ImageFiles))
+		for i, file := range req.ImageFiles {
+			sum := sha256.Sum256([]byte(file.ContentBase64))
+			material.ImageFiles[i] = PublishImageFile{
+				ContentBase64: fmt.Sprintf("sha256:%x", sum),
+				SHA256:        file.SHA256,
+				MediaType:     file.MediaType,
+			}
+		}
+	}
+	raw, err := json.Marshal(&material)
 	if err != nil {
 		return "", fmt.Errorf("生成发布请求指纹失败: %w", err)
 	}
